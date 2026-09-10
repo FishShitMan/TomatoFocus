@@ -273,13 +273,15 @@ namespace TomatoFocus.Core
             if (d.Achievements == null) d.Achievements = new Dictionary<string, AchievementState>(StringComparer.Ordinal);
             if (d.Rewards == null) d.Rewards = new RewardState();
             if (d.Counters == null) d.Counters = new Dictionary<string, int>(StringComparer.Ordinal);
-            if (d.Settings.BreakSeconds < 60) d.Settings.BreakSeconds = 300;
-            if (d.Settings.CustomMinutes < 0 || d.Settings.CustomMinutes > 180) d.Settings.CustomMinutes = 0;
-            if (d.Settings.BreakCustomMinutes < 0 || d.Settings.BreakCustomMinutes > 180) d.Settings.BreakCustomMinutes = 0;
+            // 设置里的"休息时长"只影响专注结束后的提醒卡片，档位固定为 5/10/15/20 分钟；
+            // 旧数据里的 3 / 25 等值统一回落到 5 分钟。
+            if (d.Settings.BreakSeconds != 600 && d.Settings.BreakSeconds != 900 && d.Settings.BreakSeconds != 1200)
+                d.Settings.BreakSeconds = 300;
+            // 自定档位是"会话级"的：每次启动都回到「自定」无参数状态（退出时也会主动清一次）。
+            // 旧版本曾把自定值当挡位存进 CustomPresets 并在这里回填，会导致"重启后凭空出现某个数值"，现已去掉。
+            d.Settings.CustomMinutes = 0;
+            d.Settings.BreakCustomMinutes = 0;
             if (d.Settings.LastPresetMinutes < 0 || d.Settings.LastPresetMinutes > 180) d.Settings.LastPresetMinutes = 0;
-            // 迁移：旧版本把自定值当作挡位存进 CustomPresets
-            if (d.Settings.CustomMinutes == 0 && d.Settings.CustomPresets != null && d.Settings.CustomPresets.Count > 0)
-                d.Settings.CustomMinutes = d.Settings.CustomPresets[d.Settings.CustomPresets.Count - 1];
             // 默认主题与默认音效永远视为已拥有；空值规整为默认项
             if (!d.Rewards.Owned.Contains("th_fresh")) d.Rewards.Owned.Add("th_fresh");
             if (!d.Rewards.Owned.Contains("sn_default")) d.Rewards.Owned.Add("sn_default");

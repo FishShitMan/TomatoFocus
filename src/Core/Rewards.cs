@@ -56,6 +56,8 @@ namespace TomatoFocus.Core
             l.Add(R("sn_default", "sound", 0, "leaf"));
             l.Add(R("sn_chime", "sound", 10, "leaf"));
             l.Add(R("sn_soft", "sound", 10, "leaf"));
+            l.Add(R("sn_drop", "sound", 15, "leaf"));
+            l.Add(R("sn_wood", "sound", 15, "leaf"));
             return l;
         }
 
@@ -143,15 +145,42 @@ namespace TomatoFocus.Core
             return I18n.T("rw." + data.Rewards.EquippedTitle);
         }
 
+        /// <summary>
+        /// 奖励图标的统一口径：兑换列表与顶栏展示栏必须走同一个方法，
+        /// 否则会出现"同一枚称号在两处图标不一样"的问题。
+        /// 圆形底色上不放番茄实心图案（太满），统一改用叶片轮廓。
+        /// </summary>
+        public static string IconFor(RewardDef def)
+        {
+            if (def == null) return "leaf";
+            return def.Icon == "tomato" ? "leaf" : def.Icon;
+        }
+
+        /// <summary>按 id 取图标（装备栏位用，与列表口径一致）。</summary>
+        public static string IconForId(string id)
+        {
+            return IconFor(ById(id));
+        }
+
         /// <summary>当前装备的提示音对应的音色 id。</summary>
         public static string SoundIdFor(AppData data)
         {
             switch (data.Rewards.EquippedSound)
             {
-                case "sn_soft": return "soft";
                 case "sn_chime": return "chime";
-                default: return "chime";
+                case "sn_soft": return "soft";
+                case "sn_drop": return "drop";
+                case "sn_wood": return "wood";
+                // 默认提示音是独立的"温和双音"，不再回落到清脆铃音（两者听感必须不同）
+                default: return "default";
             }
+        }
+
+        /// <summary>一次专注结算应播放的音色：本次解锁了成就就播成就音，否则播已装备的提示音。
+        /// 二者互斥，保证"完成一次只响一次"。</summary>
+        public static string CompletionSoundId(AppData data, int unlockedCount)
+        {
+            return unlockedCount > 0 ? "unlock" : SoundIdFor(data);
         }
 
         /// <summary>默认项（成本 0）：默认拥有、默认使用。</summary>

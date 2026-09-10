@@ -111,8 +111,12 @@ namespace TomatoFocus.Ui
             float calTop = card.Bottom + 14f;
             float calH = Math.Max(170f, notesCard.Top - 14f - calTop);
             _calendarRect = new RectangleF(r.Left, calTop, r.Width, calH);
+            long t1 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawCalendar(pt, _calendarRect);
+            PerfCounters.Add("  日历", t1);
+            t1 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawNotes(pt, notesCard);
+            PerfCounters.Add("  笔记", t1);
         }
 
         /// <summary>日历下方的「笔记」栏位：内容随本次番茄钟一起保存。</summary>
@@ -131,23 +135,41 @@ namespace TomatoFocus.Ui
             string text = _app.Data.Settings.NoteDraft ?? "";
             var font = pt.F(11.5f);
             const float lh = 16f;
+            // 右侧留出 14px：光标不贴死右边缘，输入法组合串才有就地显示的空间
+            const float noteTextW = 14f;
+            _noteCaretRect = RectangleF.Empty;
             if (string.IsNullOrEmpty(text))
             {
-                pt.Text(I18n.T("notes.placeholder"), font, Theme.Alpha(t.TextMuted, 150),
-                    new RectangleF(area.Left, area.Top, area.Width, area.Height));
+                // 聚焦时不画占位提示：光标就在同一位置，快路径擦/画光标会把它啃掉一块
+                if (!_noteFocus)
+                    pt.Text(I18n.T("notes.placeholder"), font, Theme.Alpha(t.TextMuted, 150),
+                        new RectangleF(area.Left, area.Top, area.Width, area.Height));
+                _noteCaret = new PointF(area.Left + 1f, area.Top + 1f);
+                if (_noteFocus) _noteCaretRect = CaretRect(area.Left + 1f, area.Top);
             }
             else
             {
-                bool caretOn = ((int)(_time * 2)) % 2 == 0;
-                var lines = pt.WrapLines(text, font, area.Width);
+                var lines = pt.WrapLines(text, font, area.Width - noteTextW);
                 int maxLines = Math.Max(1, (int)(area.Height / lh));
                 int start = Math.Max(0, lines.Count - maxLines);     // 内容过长时显示最后几行
                 for (int i = start; i < lines.Count; i++)
+                    pt.Text(lines[i], font, t.Text, new RectangleF(area.Left, area.Top + (i - start) * lh, area.Width - noteTextW, lh));
+
+                // 组合窗口锚点 = 最后一行的行尾；y 取"行顶"，见 NoteCaretPoint 的说明
+                if (lines.Count > 0)
                 {
-                    string line = lines[i];
-                    if (i == lines.Count - 1 && _noteFocus && caretOn) line += "|";
-                    pt.Text(line, font, t.Text, new RectangleF(area.Left, area.Top + (i - start) * lh, area.Width, lh));
+                    float cx = area.Left + pt.TextWidth(lines[lines.Count - 1], font) + 1f;
+                    float lineTop = area.Top + (lines.Count - 1 - start) * lh;
+                    _noteCaret = new PointF(cx, lineTop + 1f);
+                    if (_noteFocus) _noteCaretRect = CaretRect(cx, lineTop);
                 }
+            }
+
+            // 光标是独立的一根细条（不再拼进文本里）：这样"勋章快路径"可以只擦掉/重画这一小块
+            if (_noteFocus && _noteCaretRect.Width > 0f)
+            {
+                RegisterAmbientCaret(_noteCaretRect, t.Surface, t.Text);
+                if (CaretOn) pt.FillRound(_noteCaretRect, _noteCaretRect.Width / 2f, t.Text);
             }
             Hot("notesArea", card, delegate { _noteFocus = true; _dirty = true; });
         }
@@ -232,6 +254,7 @@ namespace TomatoFocus.Ui
             float scroll = _calScroll;
             pt.Clip(rowsView, delegate
             {
+                long tcell = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 for (int d = 1; d <= daysInMonth; d++)
                 {
                     int idx = lead + d - 1;
@@ -252,12 +275,20 @@ namespace TomatoFocus.Ui
                         ? Theme.Alpha(t.AccentSoft, (int)(90 + 130f * Math.Min(1f, tenths / (float)bestDay)))
                         : t.SurfaceAlt;
                     if (isToday) fill = Theme.Blend(fill, t.AccentSoft, 0.6f);
-                    fill = Theme.Blend(fill, t.AccentSoft, hv * 0.5f);
+
+                    // 悬停：整格过渡为实心深红色块，过半后日期/番茄/数量切换为反色剪影。
+                    // 用 AccentDark 而非 Accent 是为了对比度：白字压 #C13E2A 约 5.3:1（达 WCAG AA），
+                    // 压亮红 #E2543C 只有 3.75:1，小字号会发虚。
+                    fill = Theme.Blend(fill, t.AccentDark, hv);
+                    bool mono = hv > 0.42f;
 
                     pt.FillRound(cell, 9f, fill);
-                    if (isToday) pt.StrokeRound(cell, 9f, Theme.Alpha(t.Accent, 200), 1.4f);
+                    if (isToday)
+                        pt.StrokeRound(cell, 9f,
+                            mono ? Theme.Alpha(Color.White, 210) : Theme.Alpha(t.Accent, 200), 1.4f);
 
-                    pt.Text(d.ToString(), pt.F(10.5f, isToday), isToday ? t.AccentDark : t.TextMuted,
+                    pt.Text(d.ToString(), pt.F(10.5f, isToday || mono),
+                        mono ? Color.White : (isToday ? t.AccentDark : t.TextMuted),
                         new RectangleF(cell.Left + 5, cell.Top + 3, 24, 14));
 
                     if (tenths > 0)
@@ -266,12 +297,15 @@ namespace TomatoFocus.Ui
                         var gr = new RectangleF(cell.Left + cell.Width / 2f - gs / 2f, cell.Top + cell.Height * 0.30f, gs, gs);
                         bool aborted = st != null && st.AbortedCount > 0;
                         int inTomato = tenths >= 10 ? 10 : tenths;
-                        TomatoArt.DrawTenths(pt, gr, inTomato, aborted && tenths < 10);
+                        if (mono) TomatoArt.DrawTenthsMono(pt, gr, inTomato, Color.White);
+                        else TomatoArt.DrawTenths(pt, gr, inTomato, aborted && tenths < 10);
                         if (tenths >= 10)
-                            pt.TextRight(TomatoMath.Format(tenths), pt.F(9.5f, true), t.AccentDark,
+                            pt.TextRight(TomatoMath.Format(tenths), pt.F(9.5f, true),
+                                mono ? Color.White : t.AccentDark,
                                 new RectangleF(cell.Left, cell.Bottom - 15, cell.Width - 4, 14));
                         if (aborted)
-                            pt.FillCircle(new PointF(cell.Right - 7, cell.Top + 7), 2.6f, t.Warn);
+                            pt.FillCircle(new PointF(cell.Right - 7, cell.Top + 7), 2.6f,
+                                mono ? Theme.Alpha(Color.White, 230) : t.Warn);
                     }
 
                     string k = key;
@@ -283,6 +317,7 @@ namespace TomatoFocus.Ui
                         _dirty = true;
                     });
                 }
+                PerfCounters.Add("  日历格", tcell);
             });
 
             // 内部滚动条：需要时出现，1.2 秒无操作自动淡出
@@ -522,8 +557,19 @@ namespace TomatoFocus.Ui
                     pt.FillRound(row, 12f, equipped ? Theme.Alpha(t.AccentSoft, 170) : t.SurfaceAlt);
 
                     var iconRect = new RectangleF(row.Left + 12, row.Top + 14, 28, 28);
-                    pt.FillCircle(C(iconRect), 14f, equipped ? t.Accent : Theme.Alpha(t.TextMuted, 60));
-                    IconArt.Draw(pt, def.Icon == "tomato" ? "leaf" : def.Icon, RectangleF.Inflate(iconRect, -8, -8), Color.White, 1.7f);
+                    if (def.Category == "medal")
+                    {
+                        // 未解锁：整体灰化且完全静止；已拥有：本色 + 动态扫光
+                        MedalArt.Draw(pt, iconRect, def.Id, _time, !owned, !owned);
+                        RegisterAmbientMedal(iconRect, def.Id, !owned, body);   // 已拥有的登记进动效清单（按可见区裁剪）
+                        if (owned) _ambientAnimation = true;
+                    }
+                    else
+                    {
+                        pt.FillCircle(C(iconRect), 14f, equipped ? t.Accent : Theme.Alpha(t.TextMuted, 60));
+                        // 与顶栏展示栏共用同一套图标口径
+                        IconArt.Draw(pt, Rewards.IconFor(def), RectangleF.Inflate(iconRect, -8, -8), Color.White, 1.7f);
+                    }
 
                     pt.Text(I18n.T(def.NameKey), pt.F(13f, true), t.Text,
                         new RectangleF(row.Left + 50, row.Top + 10, row.Width - 160, 20));
@@ -601,7 +647,7 @@ namespace TomatoFocus.Ui
                 });
 
             y = SectionTitle(pt, body, y, I18n.T("settings.breakSeconds"));
-            string[] options = { "3", "5", "10", "15", "25" };
+            string[] options = { "5", "10", "15", "20" };
             float x = body.Left;
             foreach (string opt in options)
             {
@@ -867,10 +913,17 @@ namespace TomatoFocus.Ui
             pt.TextCenter(I18n.T("break.skip"), pt.F(12f, true), t.TextMuted, skip);
             Hot("remSkip", skip, delegate { _app.DismissReminder(); });
 
-            var later = new RectangleF(skip.Right + 10, by, 96, 38);
-            pt.FillRound(later, 19f, t.SurfaceAlt);
-            pt.TextCenter(I18n.T("break.postpone"), pt.F(12f, true), t.TextMuted, later);
-            Hot("remLater", later, delegate { _app.DismissReminder(); });
+            // 第三颗按钮：把上一次结算保存的笔记恢复到草稿，便于在原内容上继续续写
+            bool hasNote = !string.IsNullOrEmpty(_app.LastRecordedNote);
+            var keep = new RectangleF(skip.Right + 10, by, 106, 38);
+            pt.FillRound(keep, 19f, Theme.Alpha(t.SurfaceAlt, hasNote ? 255 : 140));
+            pt.TextCenter(I18n.T("break.keepNote"), pt.F(12f, true),
+                Theme.Alpha(t.TextMuted, hasNote ? 255 : 130), keep);
+            Hot("remKeep", keep, delegate
+            {
+                ShowToast(I18n.T(_app.KeepLastNote() ? "break.keepNote.done" : "break.keepNote.none"));
+                _app.DismissReminder();
+            });
         }
 
         // --- 中断确认（行内，不弹窗） --------------------------------------

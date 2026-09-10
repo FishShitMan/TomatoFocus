@@ -147,6 +147,49 @@ namespace TomatoFocus.Render.Art
             DrawTomato(pt, r, fill, true, body, dark, pt.T.Leaf);
         }
 
+        /// <summary>单色剪影版（用于深色底上的反色显示）：未获得部分为淡墨，已获得部分为纯墨。</summary>
+        public static void DrawTenthsMono(Painter pt, RectangleF r, int tenthsInTomato, Color ink)
+        {
+            float fill = tenthsInTomato / 10f;
+            if (fill < 0f) fill = 0f;
+            if (fill > 1f) fill = 1f;
+
+            float calyxH = r.Height * 0.26f;
+            var bodyRect = new RectangleF(r.X, r.Y + calyxH, r.Width, r.Height - calyxH);
+            if (bodyRect.Width < 2f || bodyRect.Height < 2f) return;
+
+            using (var path = BodyPath(bodyRect))
+            {
+                using (var b = new SolidBrush(Theme.Alpha(ink, 70)))
+                    pt.Raw.FillPath(b, path);
+
+                if (fill > 0.01f)
+                {
+                    var clipRect = new RectangleF(
+                        bodyRect.X - 2, bodyRect.Bottom - bodyRect.Height * fill - 1,
+                        bodyRect.Width + 4, bodyRect.Height * fill + 2);
+                    var st = pt.Raw.Save();
+                    pt.Raw.SetClip(clipRect, CombineMode.Intersect);
+                    using (var fb = new SolidBrush(ink))
+                        pt.Raw.FillPath(fb, path);
+                    pt.Raw.Restore(st);
+                }
+
+                using (var pen = new Pen(Theme.Alpha(ink, 190), Math.Max(1f, r.Width * 0.014f)))
+                {
+                    var strokeState = pt.Raw.Save();
+                    pt.Raw.SetClip(path, CombineMode.Intersect);
+                    pt.Raw.DrawPath(pen, path);
+                    pt.Raw.Restore(strokeState);
+                }
+            }
+
+            DrawCalyx(pt,
+                new PointF(bodyRect.Left + bodyRect.Width / 2f, bodyRect.Top + bodyRect.Height * 0.02f),
+                Math.Min(r.Width, r.Height) * 0.0027f,
+                ink, Theme.Alpha(ink, 150));
+        }
+
         /// <summary>番茄图标（用于按钮/标签）。存在 assets 图片时优先使用图片，否则程序化绘制。</summary>
         public static void Icon(Painter pt, RectangleF r, Color? tint = null)
         {

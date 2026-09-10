@@ -49,6 +49,14 @@ namespace TomatoFocus.Ui
         private bool _noteFocus;              // 笔记栏位是否聚焦
         public bool IsNoteFocused { get { return _noteFocus; } }
 
+        /// <summary>
+        /// 笔记栏位的输入锚点（DIP）。
+        /// **这是"组合窗口左上角"的坐标，不是文字基线**：IMM32 的 `CFS_POINT.ptCurrentPos`
+        /// 取的是组合窗口左上方，若按基线口径给（例如行高 82% 处），组合串会被画低约一行。
+        /// </summary>
+        public PointF NoteCaretPoint { get { return _noteCaret; } }
+        private PointF _noteCaret = new PointF(200, 560);
+
         /// <summary>文本输入（来自 WM_CHAR，支持输入法提交的字符）。</summary>
         public void OnChar(char c)
         {
@@ -92,7 +100,10 @@ namespace TomatoFocus.Ui
             _app = app;
             _celebrate.Duration = 1.0;
             _celebrate.Easing = Ease.OutCubic;
-            _breakPresetMinutes = Math.Max(1, app.Data.Settings.BreakSeconds / 60);
+            // 休息档位与"设置里的休息时长"是两件事：
+            // 前者是用户主动开始休息时的档位（5/10/15/自定），后者只用于专注结束后的提醒卡片。
+            // 默认选最低档（5 分钟）；自定值只在本次运行内有效。
+            _breakPresetMinutes = 5;
             if (app.Data.Settings.BreakCustomMinutes > 0) _breakPresetMinutes = app.Data.Settings.BreakCustomMinutes;
         }
 
@@ -107,8 +118,140 @@ namespace TomatoFocus.Ui
             }
         }
 
+        /// <summary>触发一次短时高帧率（用于窗口显示、装备奖励等时刻的动效）。</summary>
+        public void Pulse() { Burst(); _dirty = true; }
+
+        /// <summary>调试面板里点「导出诊断报告」时触发。</summary>
+        public event Action DiagnosticsRequested;
+
         /// <summary>长按清除的当前进度（供测试观察）。</summary>
         public float HoldProgress { get { return _holdProgress; } }
+
+        /// <summary>诊断用：列出当前未收敛的动画键（定位"一直在动"的原因）。</summary>
+        public string UnsettledAnimKeys()
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var kv in _anims)
+                if (!kv.Value.Settled) { if (sb.Length > 0) sb.Append(","); sb.Append(kv.Key); }
+            return sb.Length == 0 ? "(无)" : sb.ToString();
+        }
+
+        /// <summary>是否存在"常驻慢动效"（勋章微光/彩虹渐变）。刻意与 IsAnimating 分开：
+        /// 突发动效走 60fps，常驻微光只走 6.7fps，避免长期占用 CPU。</summary>
+        public bool IsAnimatingSlow { get { return _ambientAnimation; } }
+
+        private bool _ambientAnimation;
+
+        /// <summary>笔记输入光标的当前矩形（DIP）；未聚焦时为空。</summary>
+        private RectangleF _noteCaretRect = RectangleF.Empty;
+
+        /// <summary>光标是否处于显示相位（每 500ms 切换一次）。</summary>
+        private bool CaretOn { get { return ((int)(_time * 2)) % 2 == 0; } }
+
+        /// <summary>光标细条的矩形（相对行顶）。</summary>
+        private static RectangleF CaretRect(float x, float lineTop)
+        {
+            return new RectangleF(x, lineTop + 3f, 1.6f, 11f);
+        }
+
+        // 本帧需要随快路径一起重画的光标（背景色用于擦除旧光标）
+        private RectangleF _ambientCaret = RectangleF.Empty;
+        private Color _ambientCaretBg;
+        private Color _ambientCaretInk;
+
+        private void RegisterAmbientCaret(RectangleF rect, Color bg, Color ink)
+        {
+            if (rect.Width <= 0f) return;
+            _ambientCaret = rect;
+            _ambientCaretBg = bg;
+            _ambientCaretInk = ink;
+        }
+
+        /// <summary>本帧登记到的光标矩形（供测试观察）。</summary>
+        public RectangleF AmbientCaretRect { get { return _ambientCaret; } }
+
+        /// <summary>本帧画过的、需要持续动效的勋章（顶栏 + 奖励列表里已拥有的）。</summary>
+        private struct AmbientMedal
+        {
+            public RectangleF Rect;
+            public int Index;        // 绘制顺序（与整窗绘制保持一致）
+            public string Id;
+            public bool Locked;
+            public RectangleF Clip;  // 非空时按此区域裁剪（抽屉里的勋章不能溢出面板）
+        }
+        private readonly List<AmbientMedal> _ambientMedals = new List<AmbientMedal>();
+
+        /// <summary>登记一枚"会动"的勋章（未解锁的灰显勋章是静止的，不登记）。</summary>
+        private void RegisterAmbientMedal(RectangleF rect, string id, bool locked)
+        {
+            RegisterAmbientMedal(rect, id, locked, RectangleF.Empty);
+        }
+
+        private void RegisterAmbientMedal(RectangleF rect, string id, bool locked, RectangleF clip)
+        {
+            if (string.IsNullOrEmpty(id) || rect.Width <= 0.5f) return;
+            if (locked) return;                       // 未解锁：灰显且完全静止
+            var m = new AmbientMedal();
+            m.Rect = rect;
+            m.Index = _ambientMedals.Count;
+            m.Id = id;
+            m.Locked = false;
+            m.Clip = clip;
+            _ambientMedals.Add(m);
+        }
+
+        /// <summary>本帧登记到的动效勋章数量（供测试观察）。</summary>
+        public int AmbientMedalCount { get { return _ambientMedals.Count; } }
+
+        /// <summary>
+        /// 是否处于"只有勋章（可选：笔记光标）在变"的状态。
+        /// 满足时外壳可以走快路径：贴上上一帧的缓存位图 + 只重画这些元素，
+        /// 不必整窗重绘——这正是常驻动效卡顿的根源（每帧 10ms 全窗重绘撑不起高帧率）。
+        /// 抽屉（奖励页）打开、笔记聚焦时同样适用。
+        /// </summary>
+        public bool CanDrawMedalOnly
+        {
+            get
+            {
+                if (_ambientMedals.Count == 0) return false;
+                if (_debugOpen || _confirmStop) return false;
+                if (_app.Pending != null) return false;
+                if (_toastT > 0) return false;
+                // 笔记聚焦不再排除：光标已改为独立细条，快路径会连它一起擦/画
+                return true;
+            }
+        }
+
+        /// <summary>快路径重画：先重画全部动效勋章，再处理笔记光标。调用方需保证背景是上一帧的内容。</summary>
+        public void DrawAmbientOverlay(Graphics g)
+        {
+            if (_ambientMedals.Count == 0 && _ambientCaret.Width <= 0f) return;
+            var pt = new Painter(g, Scale, _app.CurrentTheme);
+            for (int i = 0; i < _ambientMedals.Count; i++)
+            {
+                var m = _ambientMedals[i];
+                if (m.Clip.Width > 0.5f && m.Clip.Height > 0.5f)
+                {
+                    var clip = m.Clip;
+                    string id = m.Id;
+                    var rect = m.Rect;
+                    pt.Clip(clip, delegate { MedalArt.Draw(pt, rect, id, _time, true, false); });
+                }
+                else
+                {
+                    MedalArt.Draw(pt, m.Rect, m.Id, _time, true, m.Locked);
+                }
+            }
+
+            if (_ambientCaret.Width > 0f)
+            {
+                // 先擦掉旧相位的光标（笔记卡片是纯色底），再按当前相位画
+                var erase = RectangleF.Inflate(_ambientCaret, 1.5f, 0f);
+                using (var b = new SolidBrush(_ambientCaretBg))
+                    pt.Raw.FillRectangle(b, erase);
+                if (CaretOn) pt.FillRound(_ambientCaret, _ambientCaret.Width / 2f, _ambientCaretInk);
+            }
+        }
 
         /// <summary>最近一帧时间环显示的分钟数（自定输入时会跟随输入实时变化）。</summary>
         public int PreviewMinutes { get; private set; }
@@ -353,8 +496,10 @@ namespace TomatoFocus.Ui
                 }
             }
 
-            // 自定输入：点击格子以外任何地方即取消，避免浮层长期遮挡
-            if (wasEditing && _customFocus && clicked != "presetCustom" && !_customChipRect.Contains(p))
+            // 自定输入：点击格子以外任何地方即取消，避免浮层长期遮挡。
+            // 例外：点「开始」不算"点了别处"——按新规格，此时应由开始按钮统一判定
+            // （有输入就直接开始，没输入就什么都不做，且不退出编辑态）。
+            if (wasEditing && _customFocus && clicked != "presetCustom" && clicked != "btnPrimary" && !_customChipRect.Contains(p))
                 CancelCustomInput();
 
             // 中断确认条：点击条外区域即取消（只在点击前就已处于确认态时生效）
@@ -435,7 +580,7 @@ namespace TomatoFocus.Ui
             {
                 if (key == Keys.Back && _customInput.Length > 0) _customInput = _customInput.Substring(0, _customInput.Length - 1);
                 else if (key == Keys.Escape) { _customFocus = false; _customInput = ""; }
-                else if (key == Keys.Enter) CommitCustom();
+                else if (key == Keys.Enter) { if (!TryCommitCustom(true)) CancelCustomInput(); }
                 else if (key >= Keys.D0 && key <= Keys.D9) AppendCustom(((int)key - (int)Keys.D0).ToString());
                 else if (key >= Keys.NumPad0 && key <= Keys.NumPad9) AppendCustom(((int)key - (int)Keys.NumPad0).ToString());
                 _dirty = true;
@@ -493,17 +638,19 @@ namespace TomatoFocus.Ui
             _customInput += s;
         }
 
-        private void CommitCustom()
+        /// <summary>提交自定输入。返回是否提交成功；startTimer=true 时提交后立即开始倒计时。</summary>
+        private bool TryCommitCustom(bool startTimer)
         {
             int m;
-            if (int.TryParse(_customInput, out m) && m >= 1 && m <= 180)
-            {
-                // 不再新增挡位：只记住数值，自定栏位自身保留这个数字
-                if (_mode == "break") _app.Data.Settings.BreakCustomMinutes = m;
-                else _app.Data.Settings.CustomMinutes = m;
-                SelectPreset(m, "custom");
-            }
+            if (!int.TryParse(_customInput, out m) || m < 1 || m > 180) return false;
+
+            // 不再新增挡位：只记住数值（且仅在本次运行内有效），自定栏位自身保留这个数字
+            if (_mode == "break") _app.Data.Settings.BreakCustomMinutes = m;
+            else _app.Data.Settings.CustomMinutes = m;
+            SelectPreset(m, "custom");
             CancelCustomInput();
+            if (startTimer) StartNow();
+            return true;
         }
 
         /// <summary>只选择档位，不自动开始计时。</summary>
@@ -536,20 +683,26 @@ namespace TomatoFocus.Ui
                 case TimerPhase.Paused: _app.Timer.Resume(); break;
                 case TimerPhase.Break: _app.Timer.SkipBreak(); break;
                 default:
-                    if (_mode == "break")
-                    {
-                        _app.Timer.StartBreak(Math.Max(1, _breakPresetMinutes) * 60);
-                    }
-                    else
-                    {
-                        int m = _app.Timer.PlannedSeconds / 60;
-                        if (m <= 0) m = 25;
-                        _app.Timer.StartFocus(m, _app.Timer.Preset);
-                        _app.RememberPreset();
-                    }
+                    // 自定输入中：有效数值则直接开始倒计时；尚未输入或无效则什么都不做
+                    if (_customFocus) { TryCommitCustom(true); return; }
+                    StartNow();
                     break;
             }
             _dirty = true;
+        }
+
+        /// <summary>按当前档位开始（不改档位）。</summary>
+        private void StartNow()
+        {
+            if (_mode == "break")
+            {
+                _app.Timer.StartBreak(Math.Max(1, _breakPresetMinutes) * 60);
+                return;
+            }
+            int m = _app.Timer.PlannedSeconds / 60;
+            if (m <= 0) m = 5;                 // 兜底：默认最低档
+            _app.Timer.StartFocus(m, _app.Timer.Preset);
+            _app.RememberPreset();
         }
 
         private void Hot(string id, RectangleF rect, Action click, bool enabled = true, bool wheel = false, Action<PointF> drag = null)
@@ -569,10 +722,15 @@ namespace TomatoFocus.Ui
         public void Draw(Graphics g)
         {
             _hot.Clear();
-            var pt = new Painter(g, Scale, _app.CurrentTheme);
+            _ambientAnimation = false;      // 每帧由勋章绘制重新置位
+            _ambientMedals.Clear();         // 每帧重新登记需要动效的勋章
+            _ambientCaret = RectangleF.Empty;
             var t = _app.CurrentTheme;
-
+            long ts0 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             g.Clear(t.Bg);
+            PerfCounters.Add("清屏", ts0);
+
+            var pt = new Painter(g, Scale, t);
 
             var b = Bounds;
             _topBar = new RectangleF(0, 0, b.Width, 60);
@@ -584,14 +742,22 @@ namespace TomatoFocus.Ui
             _rightRect = new RectangleF(pad * 2 + leftW, contentTop, Math.Max(240f, b.Width - leftW - pad * 3), contentH);
 
             DrawTopBar(pt);
+            long ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawFocusPanel(pt);
+            PerfCounters.Add("专注面板", ts);
+            ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawRightPanel(pt);
+            PerfCounters.Add("右侧(日历+笔记)", ts);
+            ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawParticles(pt);
+            PerfCounters.Add("粒子", ts);
+            ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawConfirmBar(pt);
             DrawReminderCard(pt);
             DrawDrawer(pt);      // 抽屉永远在最上层，避免层级与热区错乱
             DrawToast(pt);
             DrawDebugPanel(pt);
+            PerfCounters.Add("其它层", ts);
         }
 
         /// <summary>调试浮窗（连续点击左上番茄 5 次打开）。</summary>
@@ -605,7 +771,7 @@ namespace TomatoFocus.Ui
                 pt.Raw.FillRectangle(dim, 0, 0, b.Width, b.Height);
             Hot("debugBackdrop", new RectangleF(0, 0, b.Width, b.Height), delegate { _debugOpen = false; _dirty = true; });
 
-            float w = 330f, h = 296f;
+            float w = 330f, h = 344f;
             var card = new RectangleF(b.Width / 2f - w / 2f, b.Height / 2f - h / 2f, w, h);
             pt.Shadow(card, 18f, 12f, t.Shadow);
             pt.FillRound(card, 16f, t.Surface);
@@ -625,6 +791,14 @@ namespace TomatoFocus.Ui
                 delegate { _app.DebugUnlockAllRewards(); });
             y = DebugButton(pt, card, y, "dbgFinish", I18n.T("debug.finishTimer"),
                 delegate { _app.DebugCompleteTimer(); _debugOpen = false; _dirty = true; });
+            y = DebugButton(pt, card, y, "dbgReport", I18n.T("debug.exportReport"),
+                delegate
+                {
+                    var h2 = DiagnosticsRequested;
+                    if (h2 != null) h2();
+                    _debugOpen = false;
+                    _dirty = true;
+                });
 
             pt.TextCenter(I18n.T("debug.hint"), pt.F(9.5f), t.TextMuted,
                 new RectangleF(card.Left, card.Bottom - 26, card.Width, 16));
@@ -671,8 +845,10 @@ namespace TomatoFocus.Ui
             string medalId = _app.Data.Rewards.EquippedMedal;
             if (!string.IsNullOrEmpty(medalId))
             {
-                pt.FillCircle(C(medalSlot), 13f, MedalColor(medalId, t));
-                IconArt.Draw(pt, "trophy", RectangleF.Inflate(medalSlot, -7f, -7f), Color.White, 1.5f);
+                // 动态勋章：金属渐变 + 扫过的高光；彩色勋章在配色方案间循环
+                MedalArt.Draw(pt, medalSlot, medalId, _time);
+                RegisterAmbientMedal(medalSlot, medalId, false);
+                _ambientAnimation = true;
             }
             else
             {
@@ -690,7 +866,9 @@ namespace TomatoFocus.Ui
             if (!string.IsNullOrEmpty(titleName))
             {
                 pt.FillRound(titleSlot, 13f, t.AccentSoft);
-                IconArt.Draw(pt, "leaf", new RectangleF(titleSlot.Left + 9f, titleSlot.Top + 7f, 12f, 12f), t.AccentDark, 1.4f);
+                // 图标必须与该称号在兑换列表里的图标一致（此前这里写死 leaf，导致两处不一样）
+                IconArt.Draw(pt, Rewards.IconForId(_app.Data.Rewards.EquippedTitle),
+                    new RectangleF(titleSlot.Left + 9f, titleSlot.Top + 7f, 12f, 12f), t.AccentDark, 1.4f);
                 pt.TextCenterV(titleName, titleSlotFont, t.AccentDark, titleSlot.Left + 25f, titleSlot);
             }
             else
@@ -847,6 +1025,8 @@ namespace TomatoFocus.Ui
                 Sound.Play(Rewards.SoundIdFor(_app.Data), _app.Data.Settings.Sound);
             else if (def.Category == "effect")
                 Celebrate(def.Id);
+            else if (def.Category == "medal")
+                Pulse();          // 装备勋章时给一段高帧率，让高光扫过看得清
         }
 
         /// <summary>快照/测试用：直接设置抽屉状态。</summary>
@@ -908,18 +1088,6 @@ namespace TomatoFocus.Ui
         }
         public void SetConfirmStop(bool visible) { _confirmStop = visible; A("confirm", 0f, 100f).Jump(visible ? 1f : 0f); }
 
-        private static Color MedalColor(string id, Theme t)
-        {
-            switch (id)
-            {
-                case "m_bronze": return Color.FromArgb(196, 124, 78);
-                case "m_silver": return Color.FromArgb(168, 176, 184);
-                case "m_gold": return Color.FromArgb(224, 176, 60);
-                case "m_rainbow": return Color.FromArgb(214, 96, 168);
-                default: return t.Accent;
-            }
-        }
-
         private void DrawIconButton(Painter pt, string id, RectangleF r, string icon, bool active, Action onClick = null)
         {
             var t = pt.T;
@@ -970,8 +1138,9 @@ namespace TomatoFocus.Ui
             if (timer.Phase == TimerPhase.Idle && _mode == "break") previewMinutes = Math.Max(1, _breakPresetMinutes);
             if (_customFocus)
             {
+                // 已点开自定栏但还没输入数字时，时间环显示 00:00；输入后实时跟随
                 int typed;
-                if (int.TryParse(_customInput, out typed) && typed >= 1 && typed <= 180) previewMinutes = typed;
+                previewMinutes = (int.TryParse(_customInput, out typed) && typed >= 1 && typed <= 180) ? typed : 0;
             }
             int displaySeconds = timer.Phase == TimerPhase.Idle ? previewMinutes * 60 : timer.RemainingSeconds;
             PreviewMinutes = previewMinutes;
@@ -1159,11 +1328,14 @@ namespace TomatoFocus.Ui
             int currentMin = breakMode ? _breakPresetMinutes : _app.Timer.PlannedSeconds / 60;
             bool locked = _app.Timer.Phase != TimerPhase.Idle;
 
-            // 自定栏位：保留上次设定的数字，不再新建挡位
+            // 自定栏位：保留本次运行内设过的数字，不再新建挡位
             int customValue = breakMode ? _app.Data.Settings.BreakCustomMinutes : _app.Data.Settings.CustomMinutes;
             string customLabel = customValue > 0
                 ? I18n.T("focus.minutes", customValue)
                 : I18n.T("focus.custom");
+            bool customSelected = breakMode
+                ? (_breakPresetMinutes != 5 && _breakPresetMinutes != 10 && _breakPresetMinutes != 15)
+                : string.Equals(_app.Timer.Preset, "custom", StringComparison.Ordinal);
 
             // 先量总宽，再整体居中，使档位行与开始按钮对齐同一中心
             float customW = pt.TextWidth(customLabel, font) + 34f;
@@ -1216,6 +1388,12 @@ namespace TomatoFocus.Ui
                     string shown = _customInput.Length == 0 ? "" : _customInput;
                     bool caretOn = ((int)(_time * 2)) % 2 == 0;
                     pt.TextCenter(shown + (caretOn ? "|" : " "), font, Theme.Shade(Tint(t.Accent), -0.25f), rr);
+                }
+                else if (customSelected)
+                {
+                    // 选中的自定档位必须也有选中态：此前完全没有，看起来像"点了没生效"
+                    pt.FillRound(rr, rr.Height / 2f, Tint(t.Accent));
+                    pt.TextCenter(customLabel, font, Color.White, rr);
                 }
                 else
                 {

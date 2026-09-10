@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.IO;
 using System.Threading;
 using System.Windows.Forms;
 using TomatoFocus.App;
@@ -25,6 +27,16 @@ namespace TomatoFocus
 
             string dataDir = ArgValue(args, "--data");
             if (!string.IsNullOrEmpty(dataDir)) AppPaths.OverrideDataDir(dataDir);
+
+            // 输入法自检：打印窗口的输入法上下文状态（用于定位"切不到中文输入法"）
+            if (HasFlag(args, "--ime"))
+            {
+                Environment.ExitCode = ImeProbe.Run(ArgValue(args, "--ime-out"));
+                return;
+            }
+
+            // 每秒帧统计写日志（验证"无操作降档"用）
+            if (HasFlag(args, "--frames-log")) MainForm.LogFrames = true;
 
             // 快照模式：离屏渲染，不创建窗口
             string sheetDir = ArgValue(args, "--sheet");
@@ -63,6 +75,19 @@ namespace TomatoFocus
                 string demo = ArgValue(args, "--demo");
                 int autoStart = 0;
                 int.TryParse(ArgValue(args, "--autostart"), out autoStart);
+
+                // 渲染性能自检：--perf 秒数 [--perf-out 报告路径]
+                double perfSeconds = 0;
+                double.TryParse(ArgValue(args, "--perf"), NumberStyles.Float, CultureInfo.InvariantCulture, out perfSeconds);
+                if (perfSeconds > 0)
+                {
+                    PerfProbe.Active = new PerfProbe(perfSeconds);
+                    string outPath = ArgValue(args, "--perf-out");
+                    PerfProbe.OutputPath = string.IsNullOrEmpty(outPath)
+                        ? Path.Combine(AppPaths.DataDir, "perf.txt")
+                        : outPath;
+                }
+
                 using (var shell = new AppShell(minimized, shot, demo, autoStart))
                 {
                     Application.Run(shell);

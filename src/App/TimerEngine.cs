@@ -49,8 +49,9 @@ namespace TomatoFocus.Core
         public TimerEngine()
         {
             Phase = TimerPhase.Idle;
-            Preset = "25";
-            PlannedSeconds = TomatoMath.StandardSeconds;
+            // 默认档位取最低档（5 分钟）；用户上次选过的固定档位会在 AppState.Load 里恢复
+            Preset = "5";
+            PlannedSeconds = 5 * 60;
             BreakSeconds = 300;
             _lastMono = MonoNow();
             _lastWall = WallNow();

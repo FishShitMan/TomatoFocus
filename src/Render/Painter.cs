@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
 using TomatoFocus.Core;
 
@@ -31,6 +32,9 @@ namespace TomatoFocus.Render
             _g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             _g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             _g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            // 必须先重置再缩放：Graphics 被长期复用时（例如帧缓存），直接 ScaleTransform
+            // 会让变换逐帧累乘，几十帧后坐标溢出，GDI+ 抛 ValueOverflow(OverflowException)。
+            _g.ResetTransform();
             _g.ScaleTransform(_scale, _scale);
         }
 
@@ -322,19 +326,69 @@ namespace TomatoFocus.Render
             _g.DrawArc(PenOf(c, width, true), center.X - radius, center.Y - radius, radius * 2, radius * 2, startDeg, sweepDeg);
         }
 
-        /// <summary>用多层圆角矩形模拟柔和投影（无需位图）。</summary>
+        /// <summary>
+        /// 用多层圆角矩形模拟柔和投影（无需位图）。
+        /// 逐帧重复这 8 层大面积的半透明填充非常贵（实测占整帧 1/3），
+        /// 因此按「圆角矩形尺寸 + 圆角 + 扩散 + 颜色 + 缩放」缓存成位图，之后只做一次 1:1 贴图。
+        /// </summary>
         public void Shadow(RectangleF r, float radius, float spread, Color color)
         {
-            int layers = 8;
-            for (int i = layers; i >= 1; i--)
+            if (r.Width <= 0.5f || r.Height <= 0.5f || spread <= 0.5f || color.A == 0) return;
+            var bmp = ShadowBitmap(r.Width, r.Height, radius, spread, color, _scale);
+            // 关键：临时重置世界变换，按设备像素做 1:1 贴图。
+            // 若带着 1.5 倍缩放去 DrawImage，GDI+ 会走 InterpolationMode 的重采样管线，比直接画 8 层还慢。
+            var st = _g.Save();
+            try
             {
-                float t = i / (float)layers;
-                float grow = spread * t;
-                int alpha = (int)(color.A * (1f - t) * 0.55f);
-                if (alpha <= 0) continue;
-                var rr = RectangleF.Inflate(r, grow, grow);
-                rr.Offset(0, spread * 0.35f);
-                FillRound(rr, radius + grow, Color.FromArgb(alpha, color.R, color.G, color.B));
+                _g.ResetTransform();
+                _g.DrawImageUnscaled(bmp, (int)Math.Round((r.Left - spread) * _scale), (int)Math.Round((r.Top - spread) * _scale));
+            }
+            finally { _g.Restore(st); }
+        }
+
+        private static readonly Dictionary<string, Bitmap> ShadowCache = new Dictionary<string, Bitmap>(StringComparer.Ordinal);
+        private static readonly object ShadowLock = new object();
+
+        private static Bitmap ShadowBitmap(float w, float h, float radius, float spread, Color color, float scale)
+        {
+            string key = w.ToString("0.#") + "|" + h.ToString("0.#") + "|" + radius.ToString("0.#") + "|" +
+                         spread.ToString("0.#") + "|" + color.ToArgb() + "|" + scale.ToString("0.##");
+            lock (ShadowLock)
+            {
+                Bitmap cached;
+                if (ShadowCache.TryGetValue(key, out cached)) return cached;
+
+                if (ShadowCache.Count > 24)
+                {
+                    foreach (var b in ShadowCache.Values) b.Dispose();
+                    ShadowCache.Clear();
+                }
+
+                int pw = (int)Math.Ceiling((w + spread * 2) * scale) + 2;
+                int ph = (int)Math.Ceiling((h + spread * 2 + spread * 0.35f) * scale) + 2;
+                var bmp = new Bitmap(pw, ph, PixelFormat.Format32bppPArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    g.ScaleTransform(scale, scale);
+                    var baseRect = new RectangleF(spread, spread, w, h);
+                    const int layers = 8;
+                    for (int i = layers; i >= 1; i--)
+                    {
+                        float t = i / (float)layers;
+                        float grow = spread * t;
+                        int alpha = (int)(color.A * (1f - t) * 0.55f);
+                        if (alpha <= 0) continue;
+                        var rr = RectangleF.Inflate(baseRect, grow, grow);
+                        rr.Offset(0, spread * 0.35f);
+                        using (var path = RoundedPath(rr, radius + grow))
+                        using (var brush = new SolidBrush(Color.FromArgb(alpha, color.R, color.G, color.B)))
+                            g.FillPath(brush, path);
+                    }
+                }
+                ShadowCache[key] = bmp;
+                return bmp;
             }
         }
 

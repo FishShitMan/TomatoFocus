@@ -24,6 +24,9 @@ namespace TomatoFocus.Core
         public Theme CurrentTheme = Theme.ById("fresh");
         public Reminder Pending;
 
+        /// <summary>最近一次结算中解锁的成就数（不落盘，仅供外壳决定播哪个音效）。</summary>
+        public int LastUnlockedCount;
+
         public event EventHandler Changed;
         public event EventHandler<string> ToastRequested;
         public event EventHandler<List<AchievementDef>> AchievementsUnlocked;
@@ -53,18 +56,40 @@ namespace TomatoFocus.Core
             I18n.Load(Data.Settings.Lang);
             CurrentTheme = Theme.ById(Data.Settings.ThemeId);
             Timer.BreakSeconds = Data.Settings.BreakSeconds;
-            // 恢复上次选择的档位，避免重启后总是回到默认 25 分钟
-            if (Data.Settings.LastPresetMinutes > 0)
+            // 恢复上次选择的"固定档位"（5/15/25）。自定档位是会话级的，不参与恢复。
+            if (Data.Settings.LastPresetMinutes > 0 &&
+                !string.Equals(Data.Settings.LastPresetId, "custom", StringComparison.Ordinal))
                 Timer.SetPresetMinutes(Data.Settings.LastPresetMinutes,
-                    string.IsNullOrEmpty(Data.Settings.LastPresetId) ? "custom" : Data.Settings.LastPresetId);
+                    string.IsNullOrEmpty(Data.Settings.LastPresetId) ? "25" : Data.Settings.LastPresetId);
         }
 
-        /// <summary>记住当前档位（含自定值），供下次启动恢复。</summary>
+        /// <summary>记住当前档位（仅固定档位；自定值按设计不跨会话保留）。</summary>
         public void RememberPreset()
         {
-            Data.Settings.LastPresetMinutes = Math.Max(1, Timer.PlannedSeconds / 60);
+            if (string.Equals(Timer.Preset, "custom", StringComparison.Ordinal))
+            {
+                Data.Settings.LastPresetId = "";      // 自定不落盘，下次启动回到「自定」
+                MarkDirty();
+                return;
+            }
+            Data.Settings.LastPresetMinutes = Math.Max(0, Timer.PlannedSeconds / 60);
             Data.Settings.LastPresetId = Timer.Preset ?? "";
             MarkDirty();
+        }
+
+        /// <summary>退出时清除会话级设置（自定档位），保证下次启动是「自定」无参数状态。</summary>
+        public void ClearEphemeralSettings()
+        {
+            if (Data.Settings.CustomMinutes == 0 && Data.Settings.BreakCustomMinutes == 0 &&
+                string.IsNullOrEmpty(Data.Settings.LastPresetId)) return;
+            Data.Settings.CustomMinutes = 0;
+            Data.Settings.BreakCustomMinutes = 0;
+            if (string.Equals(Data.Settings.LastPresetId, "custom", StringComparison.Ordinal))
+            {
+                Data.Settings.LastPresetId = "";
+                Data.Settings.LastPresetMinutes = 0;
+            }
+            Save();
         }
 
         public void MarkDirty()
@@ -173,6 +198,7 @@ namespace TomatoFocus.Core
             rec.Aborted = e.Aborted;
             rec.Note = Data.Settings.NoteDraft ?? "";     // 本次番茄钟内记录的内容随会话保存
             Data.Sessions.Add(rec);
+            LastRecordedNote = rec.Note;                  // 供提醒卡的「保留笔记」恢复续写
             Data.Settings.NoteDraft = "";
             Store.RebuildDays(Data);
 
@@ -180,6 +206,10 @@ namespace TomatoFocus.Core
 
             var unlocked = Achievements.Evaluate(Data, DateTime.Now);
             Save();
+
+            // 先把本次解锁数交给外壳：由它二选一播放"成就音/完成音"，
+            // 避免完成音与成就音先后各响一次而听起来像重复播放。
+            LastUnlockedCount = unlocked.Count;
 
             var rh = SessionRecorded;
             if (rh != null) rh(this, rec);
@@ -268,8 +298,26 @@ namespace TomatoFocus.Core
             Pending = null;
         }
 
+        /// <summary>最近一次结算保存的笔记（供提醒卡的「保留笔记」按钮恢复续写）。</summary>
+        public string LastRecordedNote = "";
+
+        /// <summary>
+        /// 把上一次结算保存的笔记恢复到草稿，便于在原内容基础上继续续写。
+        /// 只恢复一次，避免反复覆盖用户新写的内容；没有可恢复的笔记时返回 false。
+        /// </summary>
+        public bool KeepLastNote()
+        {
+            string note = LastRecordedNote ?? "";
+            if (note.Length == 0) return false;
+            Data.Settings.NoteDraft = note;
+            LastRecordedNote = "";
+            Save();
+            MarkDirty();
+            return true;
+        }
+
         // --- 数据清除与调试功能 ---------------------------------------------
-        /// <summary>清空全部进度数据（记录 / 日聚合 / 钱包 / 成就 / 兑换 / 计数器），保留设置。</summary>
+        /// <summary>清空全部进度数据（记录 / 日聚合 / 钱包 / 成就 / 兑换 / 计数器 / 当前笔记草稿），保留设置。</summary>
         public void ClearAllData()
         {
             Data.Sessions.Clear();
@@ -278,6 +326,7 @@ namespace TomatoFocus.Core
             Data.Rewards = new RewardState();
             Data.Counters.Clear();
             Data.Wallet = new Wallet();
+            Data.Settings.NoteDraft = "";          // 当前笔记属于工作数据，一并清掉
             Store.RebuildDays(Data);
             Achievements.Evaluate(Data, DateTime.Now);
             Save();

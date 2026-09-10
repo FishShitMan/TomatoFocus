@@ -135,8 +135,10 @@ namespace TomatoFocus.App
                 RectangleF hold;
                 if (LastUi.TryGetHotspot("clearHold", out hold))
                 {
-                    LastUi.OnMouseDown(new PointF(hold.Left + hold.Width / 2f, hold.Top + hold.Height / 2f));
+                    var hp = new PointF(hold.Left + hold.Width / 2f, hold.Top + hold.Height / 2f);
+                    LastUi.OnMouseDown(hp);
                     for (int i = 0; i < 40; i++) LastUi.Update(1.0 / 60.0, 1.0 / 60.0);   // 长按到约 55%
+                    LastUi.OnMouseUp(hp);   // 必须松手：否则后续收敛帧会继续计时并把样本数据真的清掉
                 }
             });
             count += Shot(app, Path.Combine(outDir, "17-break-mode.png"), delegate
@@ -149,7 +151,41 @@ namespace TomatoFocus.App
                 if (LastUi.TryGetHotspot("modeBreak", out seg))
                     LastUi.ClickAt(new PointF(seg.Left + seg.Width / 2f, seg.Top + seg.Height / 2f));
             });
+            // 日历格悬停：实心色块 + 文字/番茄反色剪影
+            count += Shot(app, Path.Combine(outDir, "18-calendar-hover.png"), delegate
+            {
+                LastUi.SetDrawer("");
+                app.Timer.Reset();
+                LastUi.Draw(LastGraphics);
+                RectangleF cell;
+                if (LastUi.TryGetHotspot("day" + DayKey.Today, out cell))
+                    LastUi.OnMouseMove(new PointF(cell.Left + cell.Width / 2f, cell.Top + cell.Height / 2f), true);
+            });
+            // 自定输入态：尚未输入时时间环显示 00:00，此时点「开始」不动作
+            count += Shot(app, Path.Combine(outDir, "19-custom-empty.png"), delegate
+            {
+                LastUi.SetDrawer("");
+                app.Timer.Reset();
+                LastUi.Draw(LastGraphics);
+                ClickChip(LastUi, "presetCustom");
+            });
+            // 自定输入态：输入数字后时间环实时同步，回车或点开始即开始倒计时
+            count += Shot(app, Path.Combine(outDir, "20-custom-typed.png"), delegate
+            {
+                LastUi.SetDrawer("");
+                app.Timer.Reset();
+                LastUi.Draw(LastGraphics);
+                if (ClickChip(LastUi, "presetCustom")) LastUi.TypeDigits("40");
+            });
             return count;
+        }
+
+        private static bool ClickChip(UiRoot ui, string id)
+        {
+            RectangleF r;
+            if (!ui.TryGetHotspot(id, out r)) return false;
+            ui.ClickAt(new PointF(r.Left + r.Width / 2f, r.Top + r.Height / 2f));
+            return true;
         }
 
         private static int _phraseIdx = -1;

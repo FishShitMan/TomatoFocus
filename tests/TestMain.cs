@@ -44,9 +44,19 @@ namespace TomatoFocus.Tests
                 TestTomatoBounds();
                 TestRingStability();
                 TestHoverFeedback();
+                TestCalendarHover();
                 TestRenderTomato();
                 TestRenderUiSnapshot();
                 TestTrayIcon();
+                TestSoundBank();
+                TestMedalAndTrayMenu();
+                TestIconConsistencyAndSoundSwitch();
+                TestBreakPresets();
+                TestImeLayouts();
+                TestDiagnostics();
+                TestKeepNote();
+                TestAmbientMedalFastPath();
+                TestNoteInput();
                 TestAssetRegistry();
                 TestLangKeys();
                 TestUiInteractions();
@@ -586,15 +596,51 @@ namespace TomatoFocus.Tests
                 True("点击空白处关闭输入", !ui.IsCustomInputActive);
                 Eq("取消后输入被清空", ui.CustomInputText, "");
 
-                // ⑤ 回车确认后档位生效且不自动开始
+                // ⑤ 新规格：点开自定栏 → 时间环 00:00；输入后实时同步；回车直接开始倒计时
+                ui.Draw(g);
+                ui.TryGetHotspot("presetCustom", out r);
+                ui.ClickAt(Center(r));
+                True("点击自定栏进入编辑态", ui.IsCustomInputActive);
+                ui.Draw(g);
+                Eq("未输入时时间环为 00:00", ui.PreviewMinutes, 0);
+                ui.OnKey(Keys.Enter);                       // 空输入回车：不开始、退出编辑
+                True("空输入回车不开始且退出编辑", !ui.IsCustomInputActive && app.Timer.Phase == TimerPhase.Idle);
+
                 ui.Draw(g);
                 ui.TryGetHotspot("presetCustom", out r);
                 ui.ClickAt(Center(r));
                 ui.TypeDigits("45");
+                ui.Draw(g);
+                Eq("输入后时间环实时同步", ui.PreviewMinutes, 45);
                 ui.OnKey(Keys.Enter);
-                Eq("自定 45 分钟已生效", app.Timer.PlannedSeconds, 2700);
-                Eq("自定后仍为空闲", app.Timer.Phase, TimerPhase.Idle);
+                Eq("回车后自定 45 分钟已生效", app.Timer.PlannedSeconds, 2700);
+                Eq("回车后直接开始倒计时", app.Timer.Phase, TimerPhase.Focusing);
                 True("确认后退出输入态", !ui.IsCustomInputActive);
+                app.Timer.Reset();                          // 复位，避免影响后续用例
+
+                // ⑤b 输入有效值后点「开始」也应直接开始（不必先回车确认）
+                ui.Draw(g);
+                ui.TryGetHotspot("presetCustom", out r);
+                ui.ClickAt(Center(r));
+                ui.TypeDigits("30");
+                ui.Draw(g);
+                RectangleF startBtn;
+                True("找到主按钮", ui.TryGetHotspot("btnPrimary", out startBtn));
+                ui.ClickAt(Center(startBtn));
+                Eq("点开始即用输入值开始", app.Timer.PlannedSeconds, 30 * 60);
+                Eq("点开始后进入专注", app.Timer.Phase, TimerPhase.Focusing);
+
+                // ⑤c 编辑中但尚未输入时点「开始」不执行任何操作
+                app.Timer.Reset();
+                ui.Draw(g);
+                ui.TryGetHotspot("presetCustom", out r);
+                ui.ClickAt(Center(r));
+                ui.Draw(g);
+                ui.TryGetHotspot("btnPrimary", out startBtn);
+                ui.ClickAt(Center(startBtn));
+                Eq("空输入点开始不动作", app.Timer.Phase, TimerPhase.Idle);
+                True("空输入点开始仍留在编辑态", ui.IsCustomInputActive);
+                ui.OnKey(Keys.Escape);
 
                 // ⑥ 顶栏按钮互不重叠，汉堡菜单能打开抽屉并切换标签
                 ui.Draw(g);
@@ -974,23 +1020,40 @@ namespace TomatoFocus.Tests
             I18n.Load(I18n.DefaultLang);
             app.CurrentTheme = Theme.ById("fresh");
 
-            // ① 自定值与档位的持久化往返
+            // ① 固定档位持久化往返；自定值是"会话级"，不跨会话保留
             app.Data.Settings.CustomMinutes = 45;
             app.Data.Settings.BreakCustomMinutes = 12;
-            app.Data.Settings.LastPresetMinutes = 45;
-            app.Data.Settings.LastPresetId = "custom";
+            app.Data.Settings.LastPresetMinutes = 15;
+            app.Data.Settings.LastPresetId = "15";
             True("保存成功", Store.Save(app.Data));
             var back = Store.Load();
-            Eq("自定值已持久化", back.Settings.CustomMinutes, 45);
-            Eq("休息自定值已持久化", back.Settings.BreakCustomMinutes, 12);
-            Eq("上次档位已持久化", back.Settings.LastPresetMinutes, 45);
-            Eq("上次档位标识已持久化", back.Settings.LastPresetId, "custom");
+            Eq("自定值不跨会话保留", back.Settings.CustomMinutes, 0);
+            Eq("休息自定值不跨会话保留", back.Settings.BreakCustomMinutes, 0);
+            Eq("固定档位已持久化", back.Settings.LastPresetMinutes, 15);
+            Eq("固定档位标识已持久化", back.Settings.LastPresetId, "15");
 
-            // ② 启动时恢复上次档位
+            // ② 启动恢复上次的固定档位
             var app2 = new AppState();
             app2.Load();
-            Eq("启动恢复上次档位", app2.Timer.PlannedSeconds, 45 * 60);
-            Eq("档位标识也恢复", app2.Timer.Preset, "custom");
+            Eq("启动恢复固定档位", app2.Timer.PlannedSeconds, 15 * 60);
+            Eq("档位标识同步恢复", app2.Timer.Preset, "15");
+
+            // ②b 上次若用的是自定档，重启一律回到「自定」无参数状态
+            app.Data.Settings.LastPresetMinutes = 45;
+            app.Data.Settings.LastPresetId = "custom";
+            Store.Save(app.Data);
+            var app4 = new AppState();
+            app4.Load();
+            Eq("自定档不参与恢复", app4.Timer.Preset, "5");
+            Eq("自定值保持为 0", app4.Data.Settings.CustomMinutes, 0);
+
+            // ②c 关闭时清除会话级设置
+            app4.Data.Settings.CustomMinutes = 33;
+            app4.Data.Settings.BreakCustomMinutes = 7;
+            app4.ClearEphemeralSettings();
+            Eq("关闭后自定值归零", app4.Data.Settings.CustomMinutes, 0);
+            Eq("关闭后休息自定值归零", app4.Data.Settings.BreakCustomMinutes, 0);
+            Eq("归零已落盘", Store.Load().Settings.CustomMinutes, 0);
 
             // ③ 托盘菜单：预构建且含关键项
             using (var menu = new System.Windows.Forms.ContextMenuStrip())
@@ -1207,7 +1270,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.1.5");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.3.8");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -1663,12 +1726,14 @@ namespace TomatoFocus.Tests
             app.DebugUnlockAllRewards();
             Eq("奖励全部解锁", app.Data.Rewards.Owned.Count, Rewards.All.Count);
 
+            app.Data.Settings.NoteDraft = "清除前的笔记";
             app.ClearAllData();
             Eq("清除后无会话", app.Data.Sessions.Count, 0);
             Eq("清除后钱包归零", app.Data.Wallet.TotalTenths, 0);
             Eq("清除后无成就", Achievements.UnlockedCount(app.Data), 0);
             Eq("清除后无奖励", app.Data.Rewards.Owned.Count, 0);
             Eq("清除后日聚合为空", app.Data.Days.Count, 0);
+            Eq("清除后笔记也被清空", app.Data.Settings.NoteDraft, "");
             Eq("设置被保留", app.Data.Settings.ThemeId, "night");
 
             // ③ 立即完成计时：走正常结算路径
@@ -1891,14 +1956,751 @@ namespace TomatoFocus.Tests
             var idle = TrayIconArt.StateColor(TimerPhase.Idle, Theme.ById("fresh"));
             var running = TrayIconArt.StateColor(TimerPhase.Focusing, Theme.ById("fresh"));
             var paused = TrayIconArt.StateColor(TimerPhase.Paused, Theme.ById("fresh"));
-            True("未运行与专注中颜色不同", idle.ToArgb() != running.ToArgb());
-            True("暂停色不同于专注色", paused.ToArgb() != running.ToArgb());
+            var breaking = TrayIconArt.StateColor(TimerPhase.Break, Theme.ById("fresh"));
+
+            // 四态必须两两可辨
+            var cols = new[] { idle, running, paused, breaking };
+            bool distinct = true;
+            for (int i = 0; i < cols.Length; i++)
+                for (int j = i + 1; j < cols.Length; j++)
+                    if (cols[i].ToArgb() == cols[j].ToArgb()) distinct = false;
+            True("四态颜色两两不同", distinct);
+
+            // 语义色要求：默认橙 / 运行红 / 暂停黄 / 休息绿
+            True("默认态为橙色", IsOrange(idle), ColorDesc(idle));
+            True("专注态为红色", IsRed(running), ColorDesc(running));
+            True("暂停态为黄色", IsYellow(paused), ColorDesc(paused));
+            True("休息态为绿色", IsGreen(breaking), ColorDesc(breaking));
+
+            // 状态色是语义色，不随主题漂移（否则换主题就看不出状态了）
+            bool stable = true;
+            foreach (var th in Theme.All)
+                if (TrayIconArt.StateColor(TimerPhase.Idle, th).ToArgb() != idle.ToArgb() ||
+                    TrayIconArt.StateColor(TimerPhase.Focusing, th).ToArgb() != running.ToArgb() ||
+                    TrayIconArt.StateColor(TimerPhase.Break, th).ToArgb() != breaking.ToArgb())
+                    stable = false;
+            True("状态色不随主题变化", stable);
+
+            // 画出来的图标里确实含该状态色（不是只改了个常量）
+            using (var bmp = TrayIconArt.Render(32, TimerPhase.Idle, 0, Theme.ById("fresh")))
+            {
+                int hit = 0;
+                for (int x = 0; x < 32; x++)
+                    for (int y = 0; y < 32; y++)
+                    {
+                        var c = bmp.GetPixel(x, y);
+                        if (c.A > 200 && Math.Abs(c.R - idle.R) < 60 && Math.Abs(c.G - idle.G) < 60 && Math.Abs(c.B - idle.B) < 60) hit++;
+                    }
+                True("默认图标确实使用橙色", hit > 10, "命中 " + hit + " 像素");
+            }
 
             using (var bmp = TrayIconArt.Render(32, TimerPhase.Focusing, 0.5, Theme.ById("fresh")))
             {
                 var icon = IconFactory.FromBitmap(bmp);
                 True("ICO 打包成功", icon != null && icon.Width == 32);
                 if (icon != null) icon.Dispose();
+            }
+        }
+
+        // --- 音色度量与颜色判定辅助 -----------------------------------------
+
+        private static double DurationMs(short[] pcm) { return pcm.Length * 1000.0 / 22050.0; }
+
+        /// <summary>过零率：与"主频高低"正相关，用来区分音色亮度。</summary>
+        private static double ZeroCrossRate(short[] pcm)
+        {
+            int n = 0;
+            for (int i = 1; i < pcm.Length; i++)
+                if ((pcm[i - 1] < 0 && pcm[i] >= 0) || (pcm[i - 1] >= 0 && pcm[i] < 0)) n++;
+            double sec = pcm.Length / 22050.0;
+            return sec <= 0 ? 0 : n / sec;
+        }
+
+        /// <summary>能量重心时刻（ms）：越短促的音色越小。</summary>
+        private static double EnergyCentroidMs(short[] pcm)
+        {
+            double num = 0, den = 0;
+            for (int i = 0; i < pcm.Length; i++)
+            {
+                double e = Math.Abs((int)pcm[i]);
+                num += e * i; den += e;
+            }
+            return den <= 0 ? 0 : num / den * 1000.0 / 22050.0;
+        }
+
+        private static double RelDiff(double a, double b)
+        {
+            double m = Math.Max(Math.Abs(a), Math.Abs(b));
+            return m <= 0 ? 0 : Math.Abs(a - b) / m;
+        }
+
+        private static bool SamePcm(short[] a, short[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        private static string ColorDesc(Color c) { return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2"); }
+        private static bool IsOrange(Color c) { return c.R > 200 && c.G >= 100 && c.G <= 190 && c.B < 100 && c.R - c.G > 60; }
+        private static bool IsRed(Color c) { return c.R > 180 && c.G < 100 && c.B < 100; }
+        private static bool IsYellow(Color c) { return c.R > 200 && c.G > 150 && c.B < 110 && Math.Abs(c.R - c.G) < 90; }
+        private static bool IsGreen(Color c) { return c.G > c.R + 40 && c.G > c.B + 40; }
+
+        /// <summary>统计区域内接近纯白的像素数（用于判断"反色剪影"是否生效）。</summary>
+        private static int PureWhiteCount(Bitmap bmp, RectangleF r)
+        {
+            int n = 0;
+            int x0 = Math.Max(0, (int)r.Left), x1 = Math.Min(bmp.Width, (int)r.Right);
+            int y0 = Math.Max(0, (int)r.Top), y1 = Math.Min(bmp.Height, (int)r.Bottom);
+            for (int x = x0; x < x1; x++)
+                for (int y = y0; y < y1; y++)
+                {
+                    var c = bmp.GetPixel(x, y);
+                    if (c.R > 250 && c.G > 250 && c.B > 250) n++;
+                }
+            return n;
+        }
+
+        /// <summary>音效库：可装备提示音必须两两可分辨，且"完成一次只响一次"有确定性保证。</summary>
+        private static void TestSoundBank()
+        {
+            Group("音效库");
+            string[] equipable = { "default", "chime", "soft", "drop", "wood" };
+
+            foreach (string id in equipable)
+            {
+                var pcm = Sound.PcmOf(id);
+                True("音色可合成 " + id, pcm != null && pcm.Length > 1000, "采样 " + (pcm == null ? 0 : pcm.Length));
+
+                bool loud = false;
+                foreach (short s in pcm) if (Math.Abs((int)s) > 1500) { loud = true; break; }
+                True("音色有实际音量 " + id, loud);
+
+                var wav = Sound.WavOf(id);
+                bool head = wav.Length > 44 && wav[0] == (byte)'R' && wav[1] == (byte)'I' && wav[2] == (byte)'F' && wav[3] == (byte)'F'
+                            && wav[8] == (byte)'W' && wav[9] == (byte)'A';
+                True("WAV 文件头合法 " + id, head);
+                Eq("WAV 长度字段自洽 " + id, BitConverter.ToInt32(wav, 4), wav.Length - 8);
+            }
+
+            // 任意两个音色，至少要在「时长 / 亮度（过零率）/ 能量重心」之一上明显不同
+            foreach (string id in equipable)
+                Console.WriteLine("      音色 " + id.PadRight(8)
+                    + " 时长 " + DurationMs(Sound.PcmOf(id)).ToString("0").PadLeft(4) + "ms"
+                    + "  过零 " + ZeroCrossRate(Sound.PcmOf(id)).ToString("0").PadLeft(5) + "/s"
+                    + "  重心 " + EnergyCentroidMs(Sound.PcmOf(id)).ToString("0").PadLeft(3) + "ms");
+            for (int i = 0; i < equipable.Length; i++)
+                for (int j = i + 1; j < equipable.Length; j++)
+                {
+                    var pa = Sound.PcmOf(equipable[i]);
+                    var pb = Sound.PcmOf(equipable[j]);
+                    double dDur = RelDiff(DurationMs(pa), DurationMs(pb));
+                    double dZcr = RelDiff(ZeroCrossRate(pa), ZeroCrossRate(pb));
+                    double dCen = RelDiff(EnergyCentroidMs(pa), EnergyCentroidMs(pb));
+                    double best = Math.Max(dDur, Math.Max(dZcr, dCen));
+                    True("音色可分辨 " + equipable[i] + " / " + equipable[j], best >= 0.20,
+                        "时长差 " + dDur.ToString("P0") + " 亮度差 " + dZcr.ToString("P0") + " 重心差 " + dCen.ToString("P0"));
+                }
+
+            // 曾经"默认提示音"与"清脆提示音"映射到同一段波形，闭眼听不出区别
+            True("默认音与清脆音波形不同", !SamePcm(Sound.PcmOf("default"), Sound.PcmOf("chime")));
+            True("默认音与清脆音时长差 > 50%",
+                RelDiff(DurationMs(Sound.PcmOf("default")), DurationMs(Sound.PcmOf("chime"))) > 0.5,
+                "默认 " + DurationMs(Sound.PcmOf("default")).ToString("0") + "ms / 清脆 " + DurationMs(Sound.PcmOf("chime")).ToString("0") + "ms");
+
+            // 提示音装备映射：默认档必须落到 default，不再回落到 chime
+            var d = new AppData();
+            Store.Normalize(d);
+            Eq("默认档映射到 default", Rewards.SoundIdFor(d), "default");
+            foreach (var pair in new[] { new[] { "sn_chime", "chime" }, new[] { "sn_soft", "soft" },
+                                         new[] { "sn_drop", "drop" }, new[] { "sn_wood", "wood" } })
+            {
+                d.Rewards.Owned.Add(pair[0]);
+                d.Rewards.EquippedSound = pair[0];
+                Eq("装备 " + pair[0] + " 映射到 " + pair[1], Rewards.SoundIdFor(d), pair[1]);
+            }
+
+            // 结算音效二选一：解锁了成就就播成就音，否则播已装备的完成音（绝不两声）
+            d.Rewards.EquippedSound = "sn_default";
+            Eq("无解锁时播已装备提示音", Rewards.CompletionSoundId(d, 0), "default");
+            Eq("有解锁时改播成就音", Rewards.CompletionSoundId(d, 3), "unlock");
+            True("成就音独立于提示音", Rewards.CompletionSoundId(d, 1) != Rewards.CompletionSoundId(d, 0)
+                                       && !SamePcm(Sound.PcmOf("unlock"), Sound.PcmOf("default")));
+
+            // 同一音色在 200ms 内的重复请求会被合并：两个调用点先后触发也只响一次
+            Sound.ClearRecent();
+            Sound.Play("wood", true);
+            Sound.Play("wood", true);
+            Eq("瞬间重复请求合并为一次", Sound.PlayCount, 1);
+
+            System.Threading.Thread.Sleep(260);
+            Sound.Play("wood", true);
+            Eq("超过合并窗口后可再次播放", Sound.PlayCount, 2);
+
+            Sound.ClearRecent();
+            Sound.Play("wood", false);
+            Eq("音效关闭时完全不播", Sound.PlayCount, 0);
+            Sound.ClearRecent();
+        }
+
+        /// <summary>日历格悬停：实心色块填充 + 日期/番茄反色剪影。</summary>
+        private static void TestCalendarHover()
+        {
+            Group("日历悬停");
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+            app.Timer.SetPresetMinutes(25, "25");
+            app.DebugAddTomatoes(12);                 // 让今天有数据（格子会画番茄与数量）
+
+            using (var a = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var ga = Graphics.FromImage(a))
+            using (var b = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var gb = Graphics.FromImage(b))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                ui.SetViewMonth(DateTime.Now);
+                ui.Draw(ga);
+
+                string id = "day" + DayKey.Today;
+                RectangleF cell;
+                if (!ui.TryGetHotspot(id, out cell)) { True("找到今日格", false); return; }
+                True("找到今日格", true);
+
+                // 基准帧：鼠标停在窗口角落
+                ui.OnMouseMove(new PointF(20, 690), true);
+                for (int i = 0; i < 40; i++) { ui.Draw(ga); ui.Update(1.0 / 60.0); }
+                ui.Draw(ga);
+
+                // 悬停帧：鼠标移到今日格中央
+                ui.OnMouseMove(Center(cell), true);
+                for (int i = 0; i < 40; i++) { ui.Draw(gb); ui.Update(1.0 / 60.0); }
+                ui.Draw(gb);
+
+                // ① 悬停时整格变成实心深色块（取格子左侧中点，避开日期与番茄）
+                int sx = (int)(cell.Left + 5), sy = (int)(cell.Top + cell.Height / 2f);
+                var c0 = a.GetPixel(sx, sy);
+                var c1 = b.GetPixel(sx, sy);
+                int lumBefore = (c0.R + c0.G + c0.B) / 3;
+                int lumAfter = (c1.R + c1.G + c1.B) / 3;
+                True("悬停色块明显变深", lumBefore - lumAfter > 80,
+                    ColorDesc(c0) + " → " + ColorDesc(c1) + "（亮度 " + lumBefore + " → " + lumAfter + "）");
+
+                // ② 日期数字变成白色剪影，未悬停时不是白色
+                // 采样区必须完全落在圆角内，否则会把圆角外的白色卡片背景算成"白色文字"
+                var numRect = new RectangleF(cell.Left + 5, cell.Top + 4, 15, 12);
+                int whiteHover = PureWhiteCount(b, numRect);
+                int whiteIdle = PureWhiteCount(a, numRect);
+                True("悬停时日期为白色剪影", whiteHover >= 4, "白色像素 " + whiteHover);
+                True("未悬停时日期不是白色", whiteIdle == 0, "白色像素 " + whiteIdle);
+
+                // ③ 番茄区域出现白色剪影（数量文字同理）
+                float gs = Math.Min(cell.Width * 0.46f, cell.Height * 0.52f);
+                var gr = new RectangleF(cell.Left + cell.Width / 2f - gs / 2f, cell.Top + cell.Height * 0.30f, gs, gs);
+                True("悬停时番茄为白色剪影", PureWhiteCount(b, gr) >= 10, "白色像素 " + PureWhiteCount(b, gr));
+                True("未悬停时番茄不是白色", PureWhiteCount(a, gr) == 0, "白色像素 " + PureWhiteCount(a, gr));
+
+                // ④ 移开鼠标后必须还原（悬停不能留痕）
+                ui.OnMouseMove(new PointF(20, 690), true);
+                for (int i = 0; i < 60; i++) { ui.Draw(ga); ui.Update(1.0 / 60.0); }
+                ui.Draw(ga);
+                var c2 = a.GetPixel(sx, sy);
+                True("移开后恢复原样", (c2.R + c2.G + c2.B) / 3 - lumAfter > 80, ColorDesc(c2));
+            }
+        }
+
+        /// <summary>勋章动效 + 托盘菜单定位（v1.3.0 新增）。</summary>
+        private static void TestMedalAndTrayMenu()
+        {
+            Group("勋章动效与托盘菜单");
+            var t = Theme.ById("fresh");
+
+            // ① 彩虹勋章颜色随时间流转；其余勋章保持本色
+            var c0 = MedalArt.ShownColor("m_rainbow", t, 0.0);
+            var c1 = MedalArt.ShownColor("m_rainbow", t, 2.0);
+            var c2 = MedalArt.ShownColor("m_rainbow", t, 4.0);
+            True("彩虹勋章颜色随时间变化", c0.ToArgb() != c1.ToArgb() && c1.ToArgb() != c2.ToArgb(),
+                ColorDesc(c0) + "/" + ColorDesc(c1) + "/" + ColorDesc(c2));
+            Eq("金属勋章本色不随时间变", MedalArt.ShownColor("m_gold", t, 0.0).ToArgb(), MedalArt.ShownColor("m_gold", t, 3.7).ToArgb());
+            True("四种勋章本色互不相同",
+                MedalArt.BaseColor("m_bronze", t).ToArgb() != MedalArt.BaseColor("m_silver", t).ToArgb() &&
+                MedalArt.BaseColor("m_silver", t).ToArgb() != MedalArt.BaseColor("m_gold", t).ToArgb() &&
+                MedalArt.BaseColor("m_gold", t).ToArgb() != MedalArt.BaseColor("m_rainbow", t).ToArgb());
+
+            // ② 勋章确实画得出内容，且高光/星芒随时间改变画面
+            using (var b1 = new Bitmap(64, 64, PixelFormat.Format32bppArgb))
+            using (var b2 = new Bitmap(64, 64, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(b1))
+                {
+                    var pt = new Painter(g, 1f, t);
+                    MedalArt.Draw(pt, new RectangleF(4, 4, 56, 56), "m_gold", 0.30, true);
+                }
+                using (var g = Graphics.FromImage(b2))
+                {
+                    var pt = new Painter(g, 1f, t);
+                    MedalArt.Draw(pt, new RectangleF(4, 4, 56, 56), "m_gold", 1.50, true);
+                }
+                int ink = 0, diff = 0;
+                for (int x = 0; x < 64; x++)
+                    for (int y = 0; y < 64; y++)
+                    {
+                        var a = b1.GetPixel(x, y);
+                        var b = b2.GetPixel(x, y);
+                        if (a.A > 40) ink++;
+                        if (Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B) > 24) diff++;
+                    }
+                True("勋章有实际绘制内容", ink > 800, "不透明像素 " + ink);
+                True("高光扫过会改变画面", diff > 60, "差异像素 " + diff);
+            }
+
+            // ③ 托盘菜单：以鼠标为原点向右侧展开
+            var wa = new Rectangle(0, 0, 1920, 1040);
+            var menu = new Size(220, 300);
+            var p1 = TrayMenuPlacement.Place(new Point(400, 500), menu, wa);
+            Eq("菜单在鼠标右侧", p1.X, 408);
+            Eq("纵向与鼠标对齐", p1.Y, 500);
+            var p2 = TrayMenuPlacement.Place(new Point(1850, 900), menu, wa);
+            Eq("右侧放不下时贴右边缘", p2.X, 1920 - 220);
+            Eq("下方放不下时上移", p2.Y, 1040 - 300);
+            var p3 = TrayMenuPlacement.Place(new Point(0, 0), new Size(220, 300), new Rectangle(0, 0, 200, 200));
+            Eq("极窄工作区不越左边界", p3.X, 0);
+            True("间隙为 8px", TrayMenuPlacement.Gap == 8);
+        }
+
+        /// <summary>笔记输入（含输入法提交的字符）。</summary>
+        private static void TestNoteInput()
+        {
+            Group("笔记输入");
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            I18n.Load(I18n.DefaultLang);
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                ui.Draw(g);
+
+                RectangleF notes;
+                True("找到笔记栏位", ui.TryGetHotspot("notesArea", out notes));
+                ui.ClickAt(Center(notes));
+                True("点击后笔记获得焦点", ui.IsNoteFocused);
+
+                // 组合窗口锚点：空笔记时应贴着文字区行顶
+                // （IMM32 的 CFS_POINT 取的是组合窗口左上角；按基线口径给会把拼音画低约一行）
+                ui.Draw(g);
+                float dy = ui.NoteCaretPoint.Y - (notes.Top + 32f);
+                True("空笔记时组合窗口锚点在行顶附近", dy >= -0.5f && dy <= 3f, "偏移 " + dy.ToString("0.0") + "px");
+
+                app.Data.Settings.NoteDraft = "";
+                ui.OnChar('中');
+                ui.OnChar('文');
+                Eq("中文能写入笔记", app.Data.Settings.NoteDraft, "中文");
+                ui.OnKey(Keys.Back);
+                Eq("退格删掉一个字符", app.Data.Settings.NoteDraft, "中");
+                ui.OnKey(Keys.Enter);
+                Eq("回车换行", app.Data.Settings.NoteDraft, "中\n");
+                ui.OnKey(Keys.Escape);
+                True("Esc 退出笔记焦点", !ui.IsNoteFocused);
+
+                ui.Draw(g);
+                PointF caret = ui.NoteCaretPoint;
+                True("笔记光标位置有效（供输入法定位）",
+                    caret.X > 0 && caret.Y > 0 && caret.X < 1040 && caret.Y < 700,
+                    caret.X.ToString("0") + "," + caret.Y.ToString("0"));
+            }
+        }
+
+        /// <summary>称号图标一致性 + 勋章不再旋转 + 音效即时打断。</summary>
+        private static void TestIconConsistencyAndSoundSwitch()
+        {
+            Group("图标一致性与音效切换");
+
+            // ① 兑换列表与顶栏展示栏必须走同一套图标口径
+            foreach (var def in Rewards.ByCategory("title"))
+                Eq("称号图标口径一致 " + def.Id, Rewards.IconForId(def.Id), Rewards.IconFor(def));
+            Eq("齿轮称号为 gear", Rewards.IconForId("t_artisan"), "gear");
+            Eq("日光称号为 sun", Rewards.IconForId("t_collector"), "sun");
+            Eq("番茄称号统一为 leaf", Rewards.IconForId("t_landlord"), "leaf");
+            Eq("未装备时回退 leaf", Rewards.IconForId(""), "leaf");
+            Eq("未知 id 回退 leaf", Rewards.IconForId("nope"), "leaf");
+
+            // ② 顶栏确实跟着装备的称号换图标（而不是写死某一个）
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+            app.Data.Rewards.Owned.Add("t_artisan");
+            app.Data.Rewards.Owned.Add("t_collector");
+            app.Data.Rewards.EquippedTitle = "t_artisan";
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                ui.Draw(g);
+
+                RectangleF slot;
+                True("找到称号栏位", ui.TryGetHotspot("slotTitle", out slot));
+                var first = new List<int>();
+                for (int x = (int)slot.Left + 7; x < (int)slot.Left + 23; x++)
+                    for (int y = (int)slot.Top + 5; y < (int)slot.Top + 21; y++)
+                        first.Add(bmp.GetPixel(x, y).ToArgb());
+
+                app.Data.Rewards.EquippedTitle = "t_collector";
+                ui.Draw(g);
+                ui.TryGetHotspot("slotTitle", out slot);
+                int diff = 0, idx = 0;
+                for (int x = (int)slot.Left + 7; x < (int)slot.Left + 23; x++)
+                    for (int y = (int)slot.Top + 5; y < (int)slot.Top + 21; y++)
+                    {
+                        if (bmp.GetPixel(x, y).ToArgb() != first[idx]) diff++;
+                        idx++;
+                    }
+                True("顶栏会随装备的称号更换图标", diff > 12, "差异像素 " + diff);
+            }
+
+            // ③ 勋章：动态扫光仍在；未解锁时灰化且完全静止
+            var t = Theme.ById("fresh");
+            int swept = MedalDiff(t, 0.0, 1.2, false);
+            True("动态高光会改变画面", swept > 60, "差异像素 " + swept);
+            Eq("未解锁勋章完全静止", MedalDiff(t, 0.0, 1.2, true), 0);
+
+            var locked = MedalArt.LockedColor("m_gold", t);
+            True("未解锁勋章为灰色", locked.R == locked.G && locked.G == locked.B, ColorDesc(locked));
+            True("灰度不同于本色", locked.ToArgb() != MedalArt.BaseColor("m_gold", t).ToArgb());
+
+            // ④ 彩色勋章：同一配色方案内颜色稳定、跨方案时改变（循环配色，而非逐帧旋转）
+            var c1 = MedalArt.SchemeColorAt(0.2);
+            var c2 = MedalArt.SchemeColorAt(1.2);
+            Eq("同一配色方案内颜色稳定", c1.ToArgb(), c2.ToArgb());
+            var c3 = MedalArt.SchemeColorAt(2.2);
+            True("切换到下一套配色后颜色改变", c1.ToArgb() != c3.ToArgb(),
+                ColorDesc(c1) + " -> " + ColorDesc(c3));
+            var fade = MedalArt.SchemeColorAt(1.8);
+            True("切换过渡期为插值色", fade.ToArgb() != c1.ToArgb() && fade.ToArgb() != c3.ToArgb(),
+                ColorDesc(fade));
+            True("五套配色互不相同",
+                MedalArt.SchemeColorAt(0.2).ToArgb() != MedalArt.SchemeColorAt(2.2).ToArgb() &&
+                MedalArt.SchemeColorAt(2.2).ToArgb() != MedalArt.SchemeColorAt(4.2).ToArgb() &&
+                MedalArt.SchemeColorAt(4.2).ToArgb() != MedalArt.SchemeColorAt(6.2).ToArgb());
+            Eq("配色循环回到第一套", MedalArt.SchemeColorAt(10.2).ToArgb(), MedalArt.SchemeColorAt(0.2).ToArgb());
+
+            // ④ 快速切换试听：每次请求都立刻下发，不排队、不叠音
+            Sound.ClearRecent();
+            Sound.Play("default", true);
+            Sound.Play("chime", true);
+            Sound.Play("drop", true);
+            Eq("三次切换都即时下发", Sound.PlayCount, 3);
+            Eq("当前音效即最后一次请求", Sound.LastPlayedId, "drop");
+            var recent = Sound.Recent();
+            True("按请求顺序记录", recent.Length >= 3 && recent[recent.Length - 1] == "drop");
+            Sound.StopAll();
+            Sound.ClearRecent();
+        }
+
+        private static int MedalDiff(Theme t, double a, double b, bool locked)
+        {
+            using (var b1 = new Bitmap(64, 64, PixelFormat.Format32bppArgb))
+            using (var b2 = new Bitmap(64, 64, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(b1))
+                    MedalArt.Draw(new Painter(g, 1f, t), new RectangleF(4, 4, 56, 56), "m_gold", a, !locked, locked);
+                using (var g = Graphics.FromImage(b2))
+                    MedalArt.Draw(new Painter(g, 1f, t), new RectangleF(4, 4, 56, 56), "m_gold", b, !locked, locked);
+                int diff = 0;
+                for (int x = 0; x < 64; x++)
+                    for (int y = 0; y < 64; y++)
+                    {
+                        var ca = b1.GetPixel(x, y);
+                        var cb = b2.GetPixel(x, y);
+                        if (Math.Abs(ca.R - cb.R) + Math.Abs(ca.G - cb.G) + Math.Abs(ca.B - cb.B) > 24) diff++;
+                    }
+                return diff;
+            }
+        }
+
+        /// <summary>休息档位（主动开始休息）与设置里的休息时长（专注结束后的提醒）必须解耦。</summary>
+        private static void TestBreakPresets()
+        {
+            Group("休息档位与休息时长");
+            I18n.Load(I18n.DefaultLang);
+
+            // ① 设置里的休息时长只允许 5/10/15/20；旧数据里的 3、25 回落到 5
+            var d = new AppData();
+            Store.Normalize(d);
+            Eq("休息时长默认 5 分钟", d.Settings.BreakSeconds, 300);
+            d.Settings.BreakSeconds = 180;
+            Store.Normalize(d);
+            Eq("旧的 3 分钟回落到 5 分钟", d.Settings.BreakSeconds, 300);
+            d.Settings.BreakSeconds = 1500;
+            Store.Normalize(d);
+            Eq("旧的 25 分钟回落到 5 分钟", d.Settings.BreakSeconds, 300);
+            d.Settings.BreakSeconds = 1200;
+            Store.Normalize(d);
+            Eq("新增的 20 分钟保留", d.Settings.BreakSeconds, 1200);
+
+            // ② 专注模式默认档位 = 最低档 5 分钟
+            var fresh = new TimerEngine();
+            Eq("专注默认 5 分钟", fresh.PlannedSeconds, 300);
+            Eq("专注默认档位标识", fresh.Preset, "5");
+
+            // ③ 休息档位不受"设置里的休息时长"影响，默认也是最低档
+            var app = new AppState();
+            app.Data = new AppData();
+            app.Data.Settings.BreakSeconds = 180;          // 旧数据里存的 3 分钟
+            app.CurrentTheme = Theme.ById("fresh");
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                Eq("休息档默认仍为最低档 5 分钟", ui.BreakPresetMinutes, 5);
+
+                ui.Draw(g);
+                RectangleF seg;
+                True("找到模式切换", ui.TryGetHotspot("modeBreak", out seg));
+                ui.ClickAt(Center(seg));
+                ui.Draw(g);
+
+                RectangleF c5, c10, c15, cc;
+                True("休息档含 5 分钟", ui.TryGetHotspot("preset5", out c5));
+                True("休息档含 10 分钟", ui.TryGetHotspot("preset10", out c10));
+                True("休息档含 15 分钟", ui.TryGetHotspot("preset15", out c15));
+                True("休息档保留自定", ui.TryGetHotspot("presetCustom", out cc));
+
+                ui.ClickAt(Center(c10));
+                Eq("切到 10 分钟档", ui.BreakPresetMinutes, 10);
+                Eq("不影响设置里的休息时长", app.Data.Settings.BreakSeconds, 180);
+                Eq("专注档位也没被改动", app.Timer.PlannedSeconds, 300);
+            }
+        }
+
+        /// <summary>输入法布局探测（中文输入法可用性的前置条件）。</summary>
+        private static void TestImeLayouts()
+        {
+            Group("输入法布局");
+            Eq("英文布局语言 ID", Native.PrimaryLangId((IntPtr)0x04090409), 0x09);
+            Eq("中文布局语言 ID", Native.PrimaryLangId((IntPtr)0x08040804), 0x04);
+            True("识别英文布局为非中文", !Native.IsChineseLayout((IntPtr)0x04090409));
+            True("识别中文布局", Native.IsChineseLayout((IntPtr)0x08040804));
+            True("零句柄不算中文布局", !Native.IsChineseLayout(IntPtr.Zero));
+
+            IntPtr zh = Native.FindChineseLayout();
+            True("探测到的中文布局确实是中文", zh == IntPtr.Zero || Native.IsChineseLayout(zh));
+            True("有真输入法时必须优先选它", !Native.HasChineseIme() || Native.IsImeLayout(zh));
+            True("HasChineseIme 与探测结果一致", Native.HasChineseIme() == (zh != IntPtr.Zero && Native.IsImeLayout(zh)));
+            True("零句柄不是输入法", !Native.IsImeLayout(IntPtr.Zero));
+            try
+            {
+                string list = Native.DescribeLayouts();
+                True("键盘布局枚举不抛异常", list != null && list.Length > 0);
+                True("枚举结果带输入法标注", list.Contains("[输入法]") || list.Contains("[纯键盘布局]"));
+            }
+            catch (Exception ex) { True("键盘布局枚举不抛异常", false, ex.Message); }
+        }
+
+        /// <summary>诊断报告（用户一键导出后回传排查）。</summary>
+        private static void TestDiagnostics()
+        {
+            Group("诊断报告");
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            I18n.Load(I18n.DefaultLang);
+
+            string text = TomatoFocus.App.Diagnostics.Build(app, IntPtr.Zero, "勋章快路径帧=0 全窗帧=0");
+            True("报告含版本号", text.Contains(AppInfo.Version));
+            True("报告含输入法段", text.Contains("输入法"));
+            True("报告含键盘布局枚举", text.Contains("已安装的键盘布局"));
+            True("报告含当前设置", text.Contains("当前设置") && text.Contains("休息时长"));
+            True("报告含渲染统计", text.Contains("勋章快路径帧=0"));
+            True("报告含最近日志段", text.Contains("最近日志"));
+
+            string path = TomatoFocus.App.Diagnostics.Export(text, "番茄专注-诊断报告-测试.txt");
+            True("报告能写出文件", !string.IsNullOrEmpty(path) && File.Exists(path), path);
+            True("文件名带时间戳", !string.IsNullOrEmpty(path) &&
+                 System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(path), @"-\d{8}-\d{6}(-\d+)?\.txt$"),
+                 Path.GetFileName(path ?? ""));
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            {
+                string back0 = File.ReadAllText(path);
+                True("写出内容完整", back0.Contains("诊断报告") && back0.Length == text.Length);
+                try { File.Delete(path); } catch { }
+            }
+
+            // 同一秒内连续导出两份也不应互相覆盖
+            string p1 = TomatoFocus.App.Diagnostics.Export(text, "番茄专注-诊断报告-测试.txt");
+            string p2 = TomatoFocus.App.Diagnostics.Export(text, "番茄专注-诊断报告-测试.txt");
+            True("连续导出不覆盖", !string.IsNullOrEmpty(p1) && !string.IsNullOrEmpty(p2) && p1 != p2, p1 + " / " + p2);
+            True("第一份仍在", !string.IsNullOrEmpty(p1) && File.Exists(p1));
+            try { File.Delete(p1); } catch { }
+            try { File.Delete(p2); } catch { }
+
+            string cli = TomatoFocus.App.Diagnostics.Build(null, IntPtr.Zero, null);
+            True("无应用状态时也能生成", cli.Contains("命令行自检模式"));
+        }
+
+        /// <summary>勋章快路径覆盖面 + 无操作降档。</summary>
+        private static void TestAmbientMedalFastPath()
+        {
+            Group("勋章快路径与降档");
+            I18n.Load(I18n.DefaultLang);
+
+            // ① 降档曲线：活跃 30fps、空闲 10 秒后降到约 6fps
+            Eq("刚开始（0 秒）用活跃档", FrameTiming.AmbientMs(0), FrameTiming.SlowMs);
+            Eq("9.9 秒仍是活跃档", FrameTiming.AmbientMs(9.9), FrameTiming.SlowMs);
+            Eq("10 秒降到空闲档", FrameTiming.AmbientMs(10.0), FrameTiming.AmbientIdleMs);
+            Eq("长时间空闲维持空闲档", FrameTiming.AmbientMs(3600), FrameTiming.AmbientIdleMs);
+            True("活跃档约 30fps", Math.Abs(1000.0 / FrameTiming.SlowMs - 30.3) < 1.0);
+            True("空闲档约 6fps", Math.Abs(1000.0 / FrameTiming.AmbientIdleMs - 6.25) < 0.5);
+            True("降档阈值就是 10 秒", Math.Abs(FrameTiming.AmbientIdleAfterSeconds - 10.0) < 0.001);
+
+            // ② 勋章清单：首页只登记顶栏那枚；奖励页要连列表里的勋章一起登记
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            app.CurrentTheme = Theme.ById("fresh");
+            foreach (var d in Rewards.ByCategory("medal")) app.Data.Rewards.Owned.Add(d.Id);
+            app.Data.Rewards.EquippedMedal = "m_gold";
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                ui.Draw(g);
+                Eq("首页登记 1 枚勋章", ui.AmbientMedalCount, 1);
+                True("首页可走快路径", ui.CanDrawMedalOnly);
+
+                // 打开奖励页：顶栏 + 列表里 4 枚已拥有的勋章
+                ui.SetDrawer("menu");
+                ui.SetMenuTab("rewards");
+                ui.SetRewardCategory("medal");
+                ui.Draw(g);
+                Eq("奖励页登记顶栏 + 4 枚", ui.AmbientMedalCount, 5);
+                True("奖励页同样可走快路径", ui.CanDrawMedalOnly);
+
+                // 用 SetDrawer("") 让抽屉动画直接跳到收起态（CloseDrawer 会保留关闭动画）
+                ui.SetDrawer("");
+                ui.Draw(g);
+
+                // ③ 笔记聚焦后**仍可**走快路径：光标已改成独立细条，快路径会连它一起擦/画
+                RectangleF notes;
+                if (ui.TryGetHotspot("notesArea", out notes)) ui.ClickAt(Center(notes));
+                ui.Draw(g);
+                True("笔记聚焦后仍可走快路径", ui.CanDrawMedalOnly);
+                True("笔记聚焦时登记了光标", ui.AmbientCaretRect.Width > 0f);
+
+                // 光标确实在闪：两个相位下的像素不同（Update(0.5) 恰好翻转相位）
+                app.Data.Settings.NoteDraft = "测试";
+                ui.Draw(g);
+                int dark1 = DarkPixels(bmp, ui.AmbientCaretRect);
+                ui.Update(0.5);
+                ui.Draw(g);
+                int dark2 = DarkPixels(bmp, ui.AmbientCaretRect);
+                True("光标两相位像素不同（在闪烁）", dark1 != dark2, dark1 + " / " + dark2);
+
+                // ④ 没有装备勋章时不走快路径
+                app.Data.Rewards.EquippedMedal = "";
+                ui.Draw(g);
+                Eq("未装备勋章时清单为空", ui.AmbientMedalCount, 0);
+                True("未装备勋章时不走快路径", !ui.CanDrawMedalOnly);
+            }
+        }
+
+        /// <summary>统计区域内接近文字色的像素数（判断光标是否可见）。</summary>
+        private static int DarkPixels(Bitmap bmp, RectangleF r)
+        {
+            int n = 0;
+            int x0 = Math.Max(0, (int)r.Left - 2), x1 = Math.Min(bmp.Width, (int)Math.Ceiling(r.Right) + 2);
+            int y0 = Math.Max(0, (int)r.Top - 2), y1 = Math.Min(bmp.Height, (int)Math.Ceiling(r.Bottom) + 2);
+            for (int x = x0; x < x1; x++)
+                for (int y = y0; y < y1; y++)
+                {
+                    var c = bmp.GetPixel(x, y);
+                    if (c.R < 140 && c.G < 140 && c.B < 140) n++;
+                }
+            return n;
+        }
+
+        /// <summary>提醒卡的「保留笔记」与笔记续写。</summary>
+        private static void TestKeepNote()
+        {
+            Group("提醒卡与笔记续写");
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            I18n.Load(I18n.DefaultLang);
+
+            // 本次专注写了笔记 → 结算后草稿清空，但"上次笔记"要留着供恢复
+            app.Data.Settings.NoteDraft = "先做接口对接";
+            var args = new FocusCompletedEventArgs();
+            args.FocusedSeconds = 25 * 60;
+            args.PlannedSeconds = 25 * 60;
+            args.Preset = "25";
+            args.StartedLocal = DateTime.Now;
+            var rec = app.RecordSession(args);
+            True("结算返回记录", rec != null);
+            if (rec != null) Eq("笔记随会话保存", rec.Note, "先做接口对接");
+            Eq("结算后草稿清空", app.Data.Settings.NoteDraft, "");
+            Eq("上次笔记已留档", app.LastRecordedNote, "先做接口对接");
+
+            True("保留笔记成功", app.KeepLastNote());
+            Eq("草稿恢复为原内容", app.Data.Settings.NoteDraft, "先做接口对接");
+            True("只恢复一次（避免覆盖新写内容）", !app.KeepLastNote());
+
+            // 没有笔记时点按钮应返回 false（界面会给"本次没有笔记内容"提示）
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            Store.Normalize(app2.Data);
+            app2.Data.Settings.NoteDraft = "";
+            var args2 = new FocusCompletedEventArgs();
+            args2.FocusedSeconds = 25 * 60;
+            args2.PlannedSeconds = 25 * 60;
+            args2.StartedLocal = DateTime.Now;
+            app2.RecordSession(args2);
+            Eq("空笔记时上次笔记为空", app2.LastRecordedNote, "");
+            True("无笔记时保留返回 false", !app2.KeepLastNote());
+
+            // 提醒卡三颗按钮：开始休息 / 跳过 / 保留笔记，热区互不重叠
+            var app3 = new AppState();
+            app3.Data = new AppData();
+            Store.Normalize(app3.Data);
+            app3.CurrentTheme = Theme.ById("fresh");
+            app3.Pending = new Reminder();
+            app3.Pending.BreakSeconds = 300;
+            app3.Pending.Phrase = "起身活动一下";
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app3);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                for (int i = 0; i < 40; i++) { ui.Draw(g); ui.Update(1.0 / 60.0); }
+                ui.Draw(g);
+                RectangleF a, b, c;
+                True("提醒卡有『开始休息』", ui.TryGetHotspot("remTake", out a));
+                True("提醒卡有『跳过』", ui.TryGetHotspot("remSkip", out b));
+                True("提醒卡有『保留笔记』", ui.TryGetHotspot("remKeep", out c));
+                True("三颗按钮互不重叠", a.Right <= b.Left && b.Right <= c.Left,
+                    a.Right.ToString("0") + " / " + b.Left.ToString("0") + " / " + b.Right.ToString("0") + " / " + c.Left.ToString("0"));
+                True("没有残留的『稍后提醒』热区", !ui.TryGetHotspot("remLater", out a));
             }
         }
 
@@ -1964,7 +2766,7 @@ namespace TomatoFocus.Tests
                 "tray.tip.idle", "tray.tip.running", "tray.tip.paused", "tray.tip.breaking",
                 "menu.start", "menu.pause", "menu.resume", "menu.stop", "menu.preset", "menu.showWindow",
                 "menu.minimal", "menu.autoStart", "menu.todayInfo", "menu.quit",
-                "break.title", "break.take", "break.skip", "break.postpone", "break.done", "break.water", "break.eye",
+                "break.title", "break.take", "break.skip", "break.keepNote", "break.keepNote.done", "break.keepNote.none", "break.done", "break.water", "break.eye",
                 "health.rule.sedentary", "health.rule.water", "health.rule.eye",
                 "health.source.who", "health.source.cn", "health.source.diet", "health.source.aoa"
             };

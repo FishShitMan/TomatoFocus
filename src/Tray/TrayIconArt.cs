@@ -10,14 +10,22 @@ namespace TomatoFocus.Tray
     /// <summary>程序化生成托盘图标：不同状态使用不同颜色，运行中叠加进度环。</summary>
     internal static class TrayIconArt
     {
+        // 状态色是"语义色"，刻意不随主题变化：托盘图标的首要任务是让人在任务栏一眼看出当前状态，
+        // 若跟随主题（海蓝/樱粉）就会失去这个信号。四色对应：待机橙、专注红、暂停黄、休息绿。
+        public static readonly Color IdleColor = Color.FromArgb(0xF2, 0x8C, 0x1E);    // 待机·橙
+        public static readonly Color FocusColor = Color.FromArgb(0xD9, 0x36, 0x27);   // 专注·红
+        public static readonly Color PausedColor = Color.FromArgb(0xE8, 0xB0, 0x16);  // 暂停·黄
+        public static readonly Color BreakColor = Color.FromArgb(0x2F, 0xA8, 0x62);   // 休息·绿
+
+        /// <summary>状态主色。theme 参数保留是为了与既有调用/测试保持同签名，状态色本身不随主题变化。</summary>
         public static Color StateColor(TimerPhase phase, Theme theme)
         {
             switch (phase)
             {
-                case TimerPhase.Focusing: return theme.Accent;
-                case TimerPhase.Paused: return theme.Warn;
-                case TimerPhase.Break: return theme.Leaf;
-                default: return Color.FromArgb(150, 150, 150);   // 未运行：灰调
+                case TimerPhase.Focusing: return FocusColor;
+                case TimerPhase.Paused: return PausedColor;
+                case TimerPhase.Break: return BreakColor;
+                default: return IdleColor;      // 默认（未运行）：橙色，替代原来的灰色
             }
         }
 

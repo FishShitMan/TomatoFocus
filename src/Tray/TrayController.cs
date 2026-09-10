@@ -31,7 +31,11 @@ namespace TomatoFocus.Tray
             _menu.ShowImageMargin = false;
             _menu.Renderer = new TrayMenuRenderer(app.CurrentTheme);
             _menu.DropShadowEnabled = true;
-            _menu.Opened += delegate { ApplyRoundedRegion(); };
+            _menu.Opened += delegate
+            {
+                ApplyRoundedRegion();
+                PlaceMenu();          // 以鼠标为原点向右侧展开（此刻仍在淡入，用户看不到跳动）
+            };
             _menu.SizeChanged += delegate { ApplyRoundedRegion(); };
             _menu.Opening += delegate { StartFade(true); };
             _menu.Closing += delegate (object s, ToolStripDropDownClosingEventArgs e)
@@ -193,6 +197,23 @@ namespace TomatoFocus.Tray
         }
 
         private int TodayTenths() { return Stats.TodayTenths(_app.Data); }
+
+        /// <summary>把菜单摆到鼠标右侧（以鼠标为原点向 +X 展开）。</summary>
+        private void PlaceMenu()
+        {
+            try
+            {
+                var cursor = Cursor.Position;
+                var wa = Screen.FromPoint(cursor).WorkingArea;
+                var p = TrayMenuPlacement.Place(cursor, _menu.Size, wa);
+                if (_menu.Left != p.X || _menu.Top != p.Y)
+                {
+                    _menu.SetBounds(p.X, p.Y, _menu.Width, _menu.Height);
+                    ApplyRoundedRegion();      // 位置变了，圆角 Region 需要重设
+                }
+            }
+            catch (Exception) { }
+        }
 
         private void BuildMenu()
         {

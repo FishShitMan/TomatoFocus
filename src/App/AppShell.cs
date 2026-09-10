@@ -178,10 +178,12 @@ namespace TomatoFocus.App
         {
             if (rec == null) return;
 
-            if (rec.Aborted)
-                Sound.Play(SoundId("soft"), _app.Data.Settings.Sound);
-            else
-                Sound.Play(SoundId("chime"), _app.Data.Settings.Sound);
+            // 一次结算只播一次：若本次同时解锁了成就，就播成就音（更丰富），否则播已装备的完成音。
+            // 成就事件随后也会到达，那里只弹提示与角标、不再播音，避免听起来像重复播放两次。
+            Sound.Play(rec.Aborted
+                    ? EquippedSoundOr("soft")
+                    : Rewards.CompletionSoundId(_app.Data, _app.LastUnlockedCount),
+                _app.Data.Settings.Sound);
 
             if (_form != null && _form.Visible)
             {
@@ -197,15 +199,15 @@ namespace TomatoFocus.App
         private void OnBreakCompleted(object sender, EventArgs e)
         {
             _app.ShowToast(I18n.T("break.done"));
-            Sound.Play(SoundId("start"), _app.Data.Settings.Sound);
+            Sound.Play(EquippedSoundOr("start"), _app.Data.Settings.Sound);
         }
 
-        /// <summary>按已装备的提示音奖励选择音色。</summary>
-        private string SoundId(string fallback)
+        /// <summary>已装备的"奖励提示音"音色；仍处于默认档时返回该场景自身的 fallback 音色。</summary>
+        private string EquippedSoundOr(string fallback)
         {
             string eq = _app.Data.Rewards.EquippedSound;
-            if (eq == "sn_soft") return "soft";
-            if (eq == "sn_chime") return "chime";
+            if (eq == "sn_chime" || eq == "sn_soft" || eq == "sn_drop" || eq == "sn_wood")
+                return Rewards.SoundIdFor(_app.Data);
             return fallback;
         }
 
@@ -233,7 +235,7 @@ namespace TomatoFocus.App
             {
                 _tray.ShowBalloon(I18n.T("ach.new"), I18n.T(list[0].NameKey));
             }
-            Sound.Play("chime", _app.Data.Settings.Sound);
+            // 这里刻意不播音效：结算时已按"成就优先"播过一次，再播会变成两声。
         }
 
         private void ApplyMinimalMode()
@@ -276,7 +278,9 @@ namespace TomatoFocus.App
         {
             if (_exiting) return;
             _exiting = true;
+            try { _app.ClearEphemeralSettings(); } catch { }   // 关闭即清除自定档位
             try { _app.Save(); } catch { }
+            try { Sound.StopAll(); } catch { }                 // 停掉可能还在播的提示音
             try { _tray.Dispose(); } catch { }
             try
             {
