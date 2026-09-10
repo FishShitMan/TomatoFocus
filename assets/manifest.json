@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "_readme": "把 PNG/JPG/ICO 放到本目录即可替换程序化绘制；文件缺失或损坏时自动回退到代码绘制，程序不依赖任何图片资源。",
+  "_usage": [
+    "方式一（推荐）：直接放置与槽位同名的文件，例如 assets/icon.tomato.png",
+    "方式二：在本文件 slots 里写 \"file\": \"你的文件名.png\"",
+    "保存后无需重启，程序会自动热重载。"
+  ],
+  "slots": {
+    "icon.tomato": { "file": null },
+    "icon.leaf": { "file": null },
+    "icon.tray": { "file": null },
+    "icon.btn.start": { "file": null },
+    "icon.btn.pause": { "file": null },
+    "icon.btn.stop": { "file": null },
+    "icon.btn.reset": { "file": null },
+    "icon.nav.prev": { "file": null },
+    "icon.nav.next": { "file": null },
+    "icon.settings": { "file": null },
+    "icon.achievements": { "file": null },
+    "icon.rewards": { "file": null },
+    "icon.calendar": { "file": null },
+    "icon.close": { "file": null },
+    "icon.minimize": { "file": null },
+    "medal.bronze": { "file": null },
+    "medal.silver": { "file": null },
+    "medal.gold": { "file": null },
+    "medal.rainbow": { "file": null },
+    "title.badge": { "file": null },
+    "bg.texture": { "file": null },
+    "art.empty": { "file": null }
+  }
+}

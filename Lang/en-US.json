@@ -1,0 +1,29 @@
+{
+  "app.title": "Tomato Focus",
+  "app.subtitle": "Give time to focus, keep health for yourself",
+  "app.version": "1.0",
+
+  "focus.idle": "Ready",
+  "focus.focusing": "Focusing…",
+  "focus.paused": "Paused",
+  "focus.breaking": "Break…",
+  "focus.start": "Start",
+  "focus.pause": "Pause",
+  "focus.resume": "Resume",
+  "focus.reset": "Reset",
+  "focus.stop": "End session",
+  "focus.again": "One more",
+  "focus.custom": "Custom",
+
+  "tray.idle": "Idle",
+  "tray.running": "Focusing",
+  "tray.paused": "Paused",
+  "tray.breaking": "Break",
+
+  "menu.start": "Start focus",
+  "menu.pause": "Pause",
+  "menu.resume": "Resume",
+  "menu.stop": "End session",
+  "menu.showWindow": "Show window",
+  "menu.quit": "Quit"
+}
