@@ -55,6 +55,7 @@ namespace TomatoFocus.Tests
                 TestImeLayouts();
                 TestDiagnostics();
                 TestKeepNote();
+                TestGreeting();
                 TestAmbientMedalFastPath();
                 TestNoteInput();
                 TestAssetRegistry();
@@ -74,6 +75,8 @@ namespace TomatoFocus.Tests
                 TestTrayAndMode();
                 TestModeTint();
                 TestTextWrapping();
+                TestPlannedBugFixes();
+                TestYearViewColors();
             }
             catch (Exception ex)
             {
@@ -1270,7 +1273,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.3.8");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.5.0");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -2704,6 +2707,95 @@ namespace TomatoFocus.Tests
             }
         }
 
+        /// <summary>分时段温馨问候。</summary>
+        private static void TestGreeting()
+        {
+            Group("分时段温馨问候");
+            I18n.Load(I18n.DefaultLang);
+
+            // ① 时段判定（含跨零点的夜深）
+            Eq("06:00 属于早起", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 6, 0, 0)), GreetingPeriod.Morning);
+            Eq("04:59 仍算夜深", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 4, 59, 0)), GreetingPeriod.Night);
+            Eq("05:00 起算早起", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 5, 0, 0)), GreetingPeriod.Morning);
+            Eq("08:59 仍是早起", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 8, 59, 0)), GreetingPeriod.Morning);
+            Eq("09:30 不属于任何时段", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 9, 30, 0)), GreetingPeriod.None);
+            Eq("12:00 属于午间", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 12, 0, 0)), GreetingPeriod.Noon);
+            Eq("15:00 属于下午", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 15, 0, 0)), GreetingPeriod.Afternoon);
+            Eq("23:00 属于夜深", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 23, 0, 0)), GreetingPeriod.Night);
+            Eq("00:30 仍算夜深", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 0, 30, 0)), GreetingPeriod.Night);
+            Eq("18:00 不属于任何时段", HealthRules.PeriodOf(new DateTime(2026, 9, 11, 18, 0, 0)), GreetingPeriod.None);
+            Eq("时段标识", HealthRules.PeriodKey(GreetingPeriod.Afternoon), "afternoon");
+            Eq("无时段标识为空", HealthRules.PeriodKey(GreetingPeriod.None), "");
+
+            // ② 每段每天只问候一次
+            var app = new AppState();
+            app.Data = new AppData();
+            Store.Normalize(app.Data);
+            var noon = new DateTime(2026, 9, 11, 12, 0, 0);
+            app.CheckGreeting(noon);
+            True("午间会安排问候", app.PendingGreeting != null);
+            if (app.PendingGreeting != null)
+            {
+                Eq("问候时段正确", app.PendingGreeting.Period, "noon");
+                True("语句取自该时段", app.PendingGreeting.PhraseKey.StartsWith("greet.noon.", StringComparison.Ordinal));
+                Eq("午间没有主按钮", app.PendingGreeting.PrimaryKey, "");
+            }
+            app.DismissGreeting();
+            app.CheckGreeting(noon.AddMinutes(10));
+            True("同一时段当天不再问候", app.PendingGreeting == null);
+
+            // ③ 不打断专注：延后到本轮结束再补
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            Store.Normalize(app2.Data);
+            app2.Timer.StartFocus(25, "25");
+            app2.CheckGreeting(new DateTime(2026, 9, 11, 7, 0, 0));
+            True("专注中不弹问候", app2.PendingGreeting == null);
+            app2.Timer.Reset();
+            app2.CheckGreeting(new DateTime(2026, 9, 11, 7, 5, 0));
+            True("专注结束后补弹", app2.PendingGreeting != null);
+            app2.DismissGreeting();
+
+            // ④ 早起问候带「开始专注」，深夜不带（夜里不该鼓励继续干活）
+            var app3 = new AppState();
+            app3.Data = new AppData();
+            Store.Normalize(app3.Data);
+            app3.ShowGreeting(GreetingPeriod.Morning, "2026-09-11");
+            Eq("早起问候带主按钮", app3.PendingGreeting.PrimaryKey, "greet.action.focus");
+            app3.ShowGreeting(GreetingPeriod.Night, "2026-09-11");
+            Eq("深夜问候不带主按钮", app3.PendingGreeting.PrimaryKey, "");
+
+            // ⑤ 关掉开关就不弹
+            var app4 = new AppState();
+            app4.Data = new AppData();
+            Store.Normalize(app4.Data);
+            app4.Data.Settings.GreetingOn = false;
+            app4.CheckGreeting(new DateTime(2026, 9, 11, 12, 0, 0));
+            True("关闭开关后不问候", app4.PendingGreeting == null);
+
+            // ⑥ 问候卡：热区存在且不重叠；12 秒后自动消失
+            var app5 = new AppState();
+            app5.Data = new AppData();
+            Store.Normalize(app5.Data);
+            app5.CurrentTheme = Theme.ById("fresh");
+            app5.ShowGreeting(GreetingPeriod.Morning, "2026-09-11");
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app5);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                for (int i = 0; i < 40; i++) { ui.Draw(g); ui.Update(1.0 / 60.0); }
+                ui.Draw(g);
+                RectangleF go, ok;
+                True("问候卡有主按钮", ui.TryGetHotspot("greetGo", out go));
+                True("问候卡有『知道了』", ui.TryGetHotspot("greetOk", out ok));
+                True("两个按钮不重叠", go.Right <= ok.Left);
+                ui.Update(12.2);
+                True("12 秒后自动消失", app5.PendingGreeting == null);
+            }
+        }
+
         private static void TestAssetRegistry()
         {
             Group("图片接口");
@@ -2759,7 +2851,7 @@ namespace TomatoFocus.Tests
                 "focus.stop.confirm", "focus.stop.estimate", "focus.stop.none",
                 "wallet.usable", "wallet.fragment", "wallet.fragmentHint",
                 "today.tomatoes", "today.minutes", "today.empty",
-                "cal.today", "cal.title", "cal.dayDetail", "cal.noRecord", "cal.preset", "cal.focused", "cal.aborted",
+                "cal.today", "cal.title", "cal.titleYear", "cal.dayDetail", "cal.noRecord", "cal.preset", "cal.focused", "cal.aborted",
                 "ach.title", "ach.progress", "ach.new",
                 "reward.title", "reward.available", "reward.redeem", "reward.owned", "reward.equipped",
                 "settings.title", "settings.autoStart", "settings.minimalMode", "settings.closeToTray",
@@ -2767,11 +2859,235 @@ namespace TomatoFocus.Tests
                 "menu.start", "menu.pause", "menu.resume", "menu.stop", "menu.preset", "menu.showWindow",
                 "menu.minimal", "menu.autoStart", "menu.todayInfo", "menu.quit",
                 "break.title", "break.take", "break.skip", "break.keepNote", "break.keepNote.done", "break.keepNote.none", "break.done", "break.water", "break.eye",
+                "greet.morning.title", "greet.morning.1", "greet.noon.title", "greet.noon.1",
+                "greet.afternoon.title", "greet.afternoon.1", "greet.night.title", "greet.night.1",
+                "greet.action.ok", "greet.action.focus", "settings.greeting", "settings.greeting.hint",
                 "health.rule.sedentary", "health.rule.water", "health.rule.eye",
                 "health.source.who", "health.source.cn", "health.source.diet", "health.source.aoa"
             };
             foreach (string key in required)
                 True("必备文案 " + key, I18n.T(key) != key);
+        }
+
+        /// <summary>更新规划【BUG修复】三条的回归：抽屉收起姿态 / 年视图 / 默认奖励显示。</summary>
+        private static void TestPlannedBugFixes()
+        {
+            Group("更新规划缺陷修复");
+
+            var app = new AppState();
+            app.Data = new AppData();
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+            app.Timer.SetPresetMinutes(25, "25");
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+
+                // ---- ① 抽屉收起：只有横向位移，不串页、不错位 ----
+                ui.SetDrawer("menu");
+                ui.SetMenuTab("rewards");
+                Settle(ui, g, 30);
+                RectangleF openPanel;
+                True("找到打开状态的抽屉面板", ui.TryGetHotspot("drawerPanel", out openPanel));
+                Eq("抽屉已打开", ui.CurrentDrawer, "menu");
+
+                ui.ClickAt(new PointF(120, 400));                 // 点面板外的遮罩关闭
+                for (int i = 0; i < 3; i++) { ui.Draw(g); ui.Update(1.0 / 60.0); }
+                ui.Draw(g);
+                Eq("关闭后抽屉标记清空", ui.CurrentDrawer, "");
+                Eq("关闭动画期间仍按刚才那一页绘制", ui.CurrentDrawerKind, "menu");
+                RectangleF closingPanel;
+                True("关闭动画期间仍能取到面板", ui.TryGetHotspot("drawerPanel", out closingPanel));
+                Eq("关闭动画期间面板纵向位置不变", (int)closingPanel.Top, (int)openPanel.Top);
+                Eq("关闭动画期间面板高度不变", (int)closingPanel.Height, (int)openPanel.Height);
+                True("关闭动画期间面板只向右移动", closingPanel.Left > openPanel.Left,
+                    openPanel.Left.ToString("0.0") + " -> " + closingPanel.Left.ToString("0.0"));
+                Settle(ui, g, 60);
+                Eq("动画收敛后不再保留旧内容", ui.CurrentDrawerKind, "");
+
+                // 日详情抽屉关闭时同样不串页（此前会当场被换成菜单页）
+                ui.SetDrawer("day", DayKey.Today);
+                Settle(ui, g, 30);
+                ui.OnKey(Keys.Escape);
+                for (int i = 0; i < 3; i++) { ui.Draw(g); ui.Update(1.0 / 60.0); }
+                Eq("Esc 关闭日详情后标记清空", ui.CurrentDrawer, "");
+                Eq("Esc 关闭日详情期间仍画日详情", ui.CurrentDrawerKind, "day");
+                Settle(ui, g, 60);
+
+                // ---- ② 年视图：标题只留年份、箭头翻年、格子铺满卡片 ----
+                ui.SetViewMonth(new DateTime(2026, 9, 1));
+                ui.SetYearView(true);
+                Settle(ui, g, 6);
+                True("年视图已开启", ui.IsYearView);
+                string yearTitle = I18n.T("cal.titleYear", ui.ViewMonth.Year);
+                Eq("年视图标题只显示年份", yearTitle, "2026 年");
+                True("年视图标题不含月份", yearTitle.IndexOf("月") < 0, yearTitle);
+                True("年视图格子宽度足够（旧版约 6.4px）", ui.YearCellWidth >= 8.5f, ui.YearCellWidth.ToString("0.0"));
+                True("年视图格子高度足够（旧版约 6.4px）", ui.YearCellHeight >= 8.5f, ui.YearCellHeight.ToString("0.0"));
+                True("年视图 12 行纵向铺满", ui.YearCellHeight * 12f >= 220f,
+                    (ui.YearCellHeight * 12f).ToString("0"));
+
+                RectangleF arrow;
+                True("找到下一格按钮", ui.TryGetHotspot("nextMonth", out arrow));
+                ui.ClickAt(Center(arrow));
+                Eq("年视图箭头翻年", ui.ViewMonth.Year, 2027);
+                Eq("年视图箭头不改月份", ui.ViewMonth.Month, 9);
+                ui.ClickAt(Center(arrow));
+                Eq("再翻一年", ui.ViewMonth.Year, 2028);
+
+                ui.SetYearView(false);
+                Settle(ui, g, 6);
+                True("找到下月按钮", ui.TryGetHotspot("nextMonth", out arrow));
+                ui.ClickAt(Center(arrow));
+                Eq("月视图箭头仍是翻月", ui.ViewMonth.Month, 10);
+                Eq("月视图箭头不改年份", ui.ViewMonth.Year, 2028);
+
+                // ---- ③ 默认主题 / 默认提示音：已拥有 + 装备中 ----
+                var defTheme = Rewards.ById("th_fresh");
+                var defSound = Rewards.ById("sn_default");
+                app.Data.Rewards.Owned.Remove("th_fresh");
+                app.Data.Rewards.Owned.Remove("sn_default");
+                app.Data.Rewards.EquippedTheme = "";
+                app.Data.Rewards.EquippedSound = "";
+                True("默认主题视为已拥有", Rewards.IsOwnedOrDefault(app.Data, defTheme));
+                True("默认提示音视为已拥有", Rewards.IsOwnedOrDefault(app.Data, defSound));
+                True("未装备其它主题时默认主题即装备中", Rewards.IsEquipped(app.Data, defTheme));
+                True("未装备其它提示音时默认提示音即装备中", Rewards.IsEquipped(app.Data, defSound));
+                app.Data.Wallet = new Wallet();
+                Eq("默认项不计入可兑换红点", Rewards.AffordableUnowned(app.Data), 0);
+
+                app.ClearAllData();
+                True("清空数据后默认主题仍已拥有", Rewards.IsOwnedOrDefault(app.Data, Rewards.ById("th_fresh")));
+                True("清空数据后默认主题仍装备中", Rewards.IsEquipped(app.Data, Rewards.ById("th_fresh")));
+                True("清空数据后默认提示音仍装备中", Rewards.IsEquipped(app.Data, Rewards.ById("sn_default")));
+                Eq("清空数据后红点不虚报", Rewards.AffordableUnowned(app.Data), 0);
+            }
+        }
+
+        private static bool Near(Color a, Color b, int tol)
+        {
+            return Math.Abs(a.R - b.R) <= tol && Math.Abs(a.G - b.G) <= tol && Math.Abs(a.B - b.B) <= tol;
+        }
+
+        private static void AddDay(AppData d, DateTime when, int tenths)
+        {
+            var rec = new SessionRecord();
+            rec.StartedAt = DayKey.Stamp(when);
+            rec.PlannedSec = 25 * 60;
+            rec.FocusedSec = 25 * 60;
+            rec.Tenths = tenths;
+            rec.Preset = "25";
+            d.Sessions.Add(rec);
+        }
+
+        /// <summary>年视图配色阶梯与"今天十字"（更新规划【功能优化】第 7 条）。</summary>
+        private static void TestYearViewColors()
+        {
+            Group("年视图配色与今天边框");
+            var app = new AppState();
+            app.Data = new AppData();
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+            var th = Theme.ById("fresh");
+
+            int year = DateTime.Now.Year;
+            AddDay(app.Data, new DateTime(year, 3, 5, 10, 0, 0), 10);      // 1 颗
+            AddDay(app.Data, new DateTime(year, 3, 6, 10, 0, 0), 100);     // 当年最高：10 颗
+            Store.RebuildDays(app.Data);
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                ui.SetViewMonth(new DateTime(year, 3, 1));
+                ui.SetYearView(true);
+                ui.Draw(g);
+
+                RectangleF rSmall, rBig, rToday, rEmpty;
+                True("找到 1 颗格", ui.TryGetHotspot("y" + DayKey.Of(new DateTime(year, 3, 5)), out rSmall));
+                True("找到满值格", ui.TryGetHotspot("y" + DayKey.Of(new DateTime(year, 3, 6)), out rBig));
+                True("找到今天格", ui.TryGetHotspot("y" + DayKey.Today, out rToday));
+                True("找到无记录格", ui.TryGetHotspot("y" + DayKey.Of(new DateTime(year, 8, 20)), out rEmpty));
+
+                Color cSmall = bmp.GetPixel((int)Center(rSmall).X, (int)Center(rSmall).Y);
+                Color cBig = bmp.GetPixel((int)Center(rBig).X, (int)Center(rBig).Y);
+                Color cEmpty = bmp.GetPixel((int)Center(rEmpty).X, (int)Center(rEmpty).Y);
+
+                // ① 配色阶梯：无记录 → 1 颗 → 满值，红色分量逐级拉开，满值就是主题强调色
+                True("无记录格 = 默认色", Near(cEmpty, th.SurfaceAlt, 2),
+                    cEmpty.R + "," + cEmpty.G + "," + cEmpty.B);
+                True("1 颗格明显比无记录格偏红", (cSmall.R - cSmall.G) > (cEmpty.R - cEmpty.G) + 30,
+                    (cSmall.R - cSmall.G) + " vs " + (cEmpty.R - cEmpty.G));
+                True("满值格比 1 颗格更红", (cBig.R - cBig.G) > (cSmall.R - cSmall.G) + 40,
+                    (cBig.R - cBig.G) + " vs " + (cSmall.R - cSmall.G));
+                True("满值格 = 主题强调色", Near(cBig, th.Accent, 2),
+                    cBig.R + "," + cBig.G + "," + cBig.B + " vs " + th.Accent.R + "," + th.Accent.G + "," + th.Accent.B);
+
+                // ② 今天格：填充与其它格一样走渐变（不再反相），"今天"靠边框识别
+                Color cToday = bmp.GetPixel((int)Center(rToday).X, (int)Center(rToday).Y);
+                bool todayHasData = Stats.TodayTenths(app.Data) > 0;
+                if (todayHasData)
+                {
+                    True("今天有番茄 → 填充仍是番茄数颜色（不反相）", (cToday.R - cToday.G) > 30,
+                        cToday.R + "," + cToday.G);
+                    True("今天有番茄 → 边框改用主题警示黄",
+                        ui.YearTodayBorderColor == th.Warn,
+                        ui.YearTodayBorderColor.R + "," + ui.YearTodayBorderColor.G + "," + ui.YearTodayBorderColor.B);
+                }
+                else
+                {
+                    True("今天无番茄 → 填充 = 默认色", Near(cToday, th.SurfaceAlt, 2),
+                        cToday.R + "," + cToday.G + "," + cToday.B);
+                    True("今天无番茄 → 边框 = 主题强调色(200)",
+                        ui.YearTodayBorderColor == Theme.Alpha(th.Accent, 200),
+                        ui.YearTodayBorderColor.R + "," + ui.YearTodayBorderColor.G + "," + ui.YearTodayBorderColor.B);
+                }
+                True("边框线宽按尺寸等比缩小（小于月视图的 1.4px、不低于 0.8px）",
+                    ui.YearTodayBorderWidth >= 0.8f && ui.YearTodayBorderWidth < 1.4f,
+                    ui.YearTodayBorderWidth.ToString("0.00"));
+
+                // 画面证据：无番茄时，今天格上边缘应比普通空格的上边缘明显偏主题色。
+                // 边框只有 0.8px 发丝线，抗锯齿会把它的贡献摊到相邻两行，所以取竖条内的最大偏差，
+                // 而不是赌某一个像素正好落在线上。
+                if (!todayHasData)
+                {
+                    int todayMax = 0, emptyMax = 0;
+                    for (int dy = -1; dy <= 2; dy++)
+                    {
+                        Color a = bmp.GetPixel((int)Center(rToday).X, (int)rToday.Top + dy);
+                        Color b = bmp.GetPixel((int)Center(rEmpty).X, (int)rEmpty.Top + dy);
+                        int da = a.R - a.G, db = b.R - b.G;
+                        if (da > todayMax) todayMax = da;
+                        if (db > emptyMax) emptyMax = db;
+                    }
+                    True("今天格边缘确实画了主题色边框（比空格边缘更红）",
+                        todayMax > emptyMax + 25, todayMax + " vs " + emptyMax);
+                }
+
+                // ③ 补齐"今天有番茄"这一分支：加一条今天的记录后重渲染
+                AddDay(app.Data, DateTime.Now.Date.AddHours(10), 20);
+                Store.RebuildDays(app.Data);
+                ui.Draw(g);
+                RectangleF rToday2;
+                True("重渲染后仍能找到今天格", ui.TryGetHotspot("y" + DayKey.Today, out rToday2));
+                Color cToday2 = bmp.GetPixel((int)Center(rToday2).X, (int)Center(rToday2).Y);
+                True("今天有番茄 → 填充为番茄数颜色", (cToday2.R - cToday2.G) > 30, cToday2.R + "," + cToday2.G);
+                True("今天有番茄 → 边框 = 主题警示黄",
+                    ui.YearTodayBorderColor == th.Warn,
+                    ui.YearTodayBorderColor.R + "," + ui.YearTodayBorderColor.G + "," + ui.YearTodayBorderColor.B);
+
+                // ④ 翻到不含今天的年份：不画边框
+                ui.SetViewMonth(new DateTime(year - 1, DateTime.Now.Month, 1));
+                ui.Draw(g);
+                True("去年不画今天边框", ui.YearTodayBorderColor.IsEmpty,
+                    ui.YearTodayBorderColor.R + "," + ui.YearTodayBorderColor.G + "," + ui.YearTodayBorderColor.B);
+            }
         }
     }
 }

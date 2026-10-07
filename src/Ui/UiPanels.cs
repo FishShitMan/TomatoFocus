@@ -17,60 +17,121 @@ namespace TomatoFocus.Ui
         private bool _yearView;
         private int _clearStage;          // 0 未开始 / 1 一级确认 / 2 二级确认
 
-        /// <summary>年视图：53×7 热力图，一格一天，全年节奏一目了然。</summary>
+        private float _yearCellW, _yearCellH;    // 年视图单元尺寸（供测试断言"铺满卡片"）
+
+        public float YearCellWidth { get { return _yearCellW; } }
+        public float YearCellHeight { get { return _yearCellH; } }
+
+        private const float MonthViewCellRef = 56f;   // 月视图格子的参考边长；1.4px 的今天边框就是为这个尺寸定的
+
+        /// <summary>今天格的边框颜色（跟随主题）：无番茄 = 主题强调色，有番茄 = 主题警示黄；今天不在当前年份时为 Empty。</summary>
+        public Color YearTodayBorderColor { get; private set; }
+
+        /// <summary>今天格边框线宽：按格子尺寸等比缩小，不直接套用月视图的 1.4px。</summary>
+        public float YearTodayBorderWidth { get; private set; }
+
+        /// <summary>年视图格子的圆角（填充与边框共用同一个值，保证边框紧贴格子）。</summary>
+        private static float YearCellRadius(RectangleF cell)
+        {
+            return Math.Min(3f, Math.Min(cell.Width, cell.Height) / 3f);
+        }
+
+        /// <summary>
+        /// 年视图格子配色：0 颗 = 默认色（SurfaceAlt）；有记录则按"番茄数 / 当年最高"
+        /// 从默认色渐变到主题强调色，并给最小档 25% 起步——保证"只吃了 1 颗"和"完全没记录"一眼能分开。
+        /// </summary>
+        public Color YearCellColor(int tenths, int best)
+        {
+            var th = _app.CurrentTheme ?? Theme.ById(_app.Data.Settings.ThemeId);
+            if (tenths <= 0) return th.SurfaceAlt;
+            float k = 0.25f + 0.75f * Math.Min(1f, tenths / (float)Math.Max(1, best));
+            return Theme.Blend(th.SurfaceAlt, th.Accent, k);
+        }
+
+        /// <summary>
+        /// 年视图：12 行（月）× 31 列（日）热力图，一格一天。
+        /// 旧版用 53×7 的"周"布局，格子宽度被 53 列摊薄到 ~7px，7 行只占卡片高度的六分之一，
+        /// 月份刻度还贴在卡片最底部，和上方格子完全脱节。现在改为按卡片宽度铺满、
+        /// 纵向居中，月份标签就写在每一行左边（与所在行同行对齐），顶部加一条日期刻度。
+        /// 配色也不再靠"同一个红加不同透明度"（那样深浅过近），而是按番茄数由默认色渐变到强调色；
+        /// 今天改用"细一圈的边框"提示（口径与月视图一致，线宽按格子尺寸等比缩小）：
+        /// 没有番茄时用主题强调色，有番茄时改用主题警示黄；填充始终按番茄数走渐变。
+        /// </summary>
         private void DrawYearView(Painter pt, RectangleF grid, int year)
         {
             var t = pt.T;
-            DateTime jan1 = new DateTime(year, 1, 1);
-            int lead = ((int)jan1.DayOfWeek + 6) % 7;
-            int daysInYear = DateTime.IsLeapYear(year) ? 366 : 365;
-            int weeks = (lead + daysInYear + 6) / 7;
+            var monthFont = pt.F(10f);
+            float labelW = pt.TextWidth("12月", monthFont) + 12f;   // 左侧月份标签栏
+            float rulerH = 15f;                                     // 顶部日期刻度
+            var plot = new RectangleF(grid.Left + labelW, grid.Top + rulerH,
+                Math.Max(60f, grid.Width - labelW), Math.Max(40f, grid.Height - rulerH));
+
+            float cw = plot.Width / 31f;
+            // 行高最多取宽度的 2.2 倍：既把卡片填起来，又不至于把格子拉成细长条
+            float ch = Math.Min(plot.Height / 12f, cw * 2.2f);
+            float gap = Math.Max(0.8f, Math.Min(cw, ch) * 0.18f);
+            float top = plot.Top + (plot.Height - ch * 12f) / 2f;
+            _yearCellW = cw - gap;
+            _yearCellH = ch - gap;
 
             int best = 1;
-            for (int i = 0; i < daysInYear; i++)
-            {
-                var st = Stats.DayOf(_app.Data, DayKey.Of(jan1.AddDays(i)));
-                if (st != null && st.Tenths > best) best = st.Tenths;
-            }
-
-            float cw = grid.Width / weeks;
-            float ch = Math.Min(cw, grid.Height / 7f);
-            float gap = Math.Max(0.6f, cw * 0.14f);
-
-            for (int i = 0; i < daysInYear; i++)
-            {
-                var day = jan1.AddDays(i);
-                int idx = lead + i;
-                int col = idx / 7, row = idx % 7;
-                var cell = new RectangleF(grid.Left + col * cw, grid.Top + row * ch, cw - gap, ch - gap);
-                var key = DayKey.Of(day);
-                var st = Stats.DayOf(_app.Data, key);
-                int tenths = st == null ? 0 : st.Tenths;
-                bool isToday = key == DayKey.Today;
-
-                Color fill = tenths > 0
-                    ? Theme.Alpha(t.Accent, (int)(70 + 170f * Math.Min(1f, tenths / (float)best)))
-                    : Theme.Alpha(t.TextMuted, 26);
-                if (isToday) fill = t.AccentDark;
-
-                pt.FillRound(cell, Math.Min(2.5f, cell.Width / 3f), fill);
-                string k = key;
-                Hot("y" + key, cell, delegate
-                {
-                    _dayKey = k;
-                    _drawer = "day";
-                    _drawerScroll = 0;
-                });
-            }
-
-            // 月份刻度
-            var monthFont = pt.F(9.5f);
             for (int m = 1; m <= 12; m++)
             {
-                var first = new DateTime(year, m, 1);
-                int idx = lead + (first.DayOfYear - 1);
-                float x = grid.Left + (idx / 7) * cw;
-                pt.Text(m + "月", monthFont, t.TextMuted, new RectangleF(x, grid.Bottom - 12, cw * 4.5f, 12));
+                int days = DateTime.DaysInMonth(year, m);
+                for (int d = 1; d <= days; d++)
+                {
+                    var st = Stats.DayOf(_app.Data, DayKey.Of(new DateTime(year, m, d)));
+                    if (st != null && st.Tenths > best) best = st.Tenths;
+                }
+            }
+
+            // 今天格边框的线宽：按格子尺寸等比缩小。月视图 56px 的格子配 1.4px 恰好，
+            // 年视图格子只有 ~11px，直接套 1.4px 会比格子本身还抢眼；下限 0.8px 保证仍然看得见。
+            float minSide = Math.Min(_yearCellW, _yearCellH);
+            YearTodayBorderWidth = Math.Max(0.8f, Math.Min(1.4f, 1.4f * minSide / MonthViewCellRef));
+            YearTodayBorderColor = Color.Empty;      // 今天不在当前年份就不画边框
+
+            // 日期刻度：1 / 6 / 11 / 16 / 21 / 26 / 31，让列与"几号"对得上
+            for (int d = 1; d <= 31; d += 5)
+            {
+                pt.TextCenter(d.ToString(), pt.F(9f), t.TextMuted,
+                    new RectangleF(plot.Left + (d - 1) * cw - cw / 2f, grid.Top, cw * 2f, rulerH));
+            }
+
+            for (int m = 1; m <= 12; m++)
+            {
+                int days = DateTime.DaysInMonth(year, m);
+                float rowTop = top + (m - 1) * ch;
+                pt.TextRight(m + "月", monthFont, t.TextMuted, new RectangleF(grid.Left, rowTop, labelW - 6f, ch));
+
+                for (int d = 1; d <= days; d++)
+                {
+                    var key = DayKey.Of(new DateTime(year, m, d));
+                    var st = Stats.DayOf(_app.Data, key);
+                    int tenths = st == null ? 0 : st.Tenths;
+                    bool isToday = key == DayKey.Today;
+                    var cell = new RectangleF(plot.Left + (d - 1) * cw, rowTop, cw - gap, ch - gap);
+
+                    // 填充完全按番茄数走渐变（今天不特判）：0 颗 = 默认色，越多越接近主题强调色
+                    Color fill = YearCellColor(tenths, best);
+                    float radius = YearCellRadius(cell);
+
+                    pt.FillRound(cell, radius, fill);
+                    // 今天用"细一圈的边框"提示，口径与月视图一致：没有番茄时用主题强调色；
+                    // 有番茄时改用主题警示黄——否则边框会被红色填充盖住、根本分不出来。
+                    if (isToday)
+                    {
+                        YearTodayBorderColor = tenths > 0 ? t.Warn : Theme.Alpha(t.Accent, 200);
+                        pt.StrokeRound(cell, radius, YearTodayBorderColor, YearTodayBorderWidth);
+                    }
+                    string k = key;
+                    Hot("y" + key, cell, delegate
+                    {
+                        _dayKey = k;
+                        _drawer = "day";
+                        _drawerScroll = 0;
+                    });
+                }
             }
         }
 
@@ -181,16 +242,17 @@ namespace TomatoFocus.Ui
             pt.FillRound(card, 16f, t.Surface);
 
             var head = new RectangleF(card.Left + 12, card.Top + 10, card.Width - 24, 30);
+            // 年视图只留年份（月份由每行左侧的标签承担，不再重复显示"某年某月"）
             string title = _yearView
-                ? I18n.T("cal.title", _viewMonth.Year, _viewMonth.Month)
+                ? I18n.T("cal.titleYear", _viewMonth.Year)
                 : I18n.T("cal.title", _viewMonth.Year, _viewMonth.Month);
             pt.TextLeft(title, pt.F(14.5f, true), t.Text, head);
 
-            // 翻月
+            // 翻页：月视图翻月，年视图翻年
             DrawIconButton(pt, "prevMonth", new RectangleF(head.Right - 74, head.Top + 1, 28, 28), "chevronLeft", false,
-                delegate { _viewMonth = _viewMonth.AddMonths(-1); });
+                delegate { ShiftView(-1); });
             DrawIconButton(pt, "nextMonth", new RectangleF(head.Right - 38, head.Top + 1, 28, 28), "chevronRight", false,
-                delegate { _viewMonth = _viewMonth.AddMonths(1); });
+                delegate { ShiftView(1); });
 
             // 今天
             var todayBtn = new RectangleF(head.Right - 74 - 62, head.Top + 2, 56, 26);
@@ -354,17 +416,26 @@ namespace TomatoFocus.Ui
         private void DrawDrawer(Painter pt)
         {
             float k = A("drawer").Value;
-            if (k < 0.01f) return;
+            if (k < 0.01f)
+            {
+                _closingDrawer = "";          // 动画彻底收敛，关闭快照丢掉
+                _closingDayKey = "";
+                return;
+            }
             var t = pt.T;
             var b = Bounds;
+            bool open = !string.IsNullOrEmpty(_drawer);
+            // 关闭动画期间沿用"刚才那一页"的内容、日期与滚动位置：面板只做横向滑出，
+            // 不会串页、标题不会提前消失、滚动位置也不会被就地归零。
+            string kind = open ? _drawer : _closingDrawer;
+            string dayKey = open ? _dayKey : _closingDayKey;
+            float scroll = open ? _drawerScroll : _closingScroll;
 
             // 点击抽屉以外区域关闭（顶栏除外，便于直接切换抽屉）
             Hot("backdrop", new RectangleF(0, 60, b.Width, Math.Max(0, b.Height - 60)), delegate
             {
-                _drawer = "";
-                _dayKey = "";
                 _confirmStop = false;
-                _dirty = true;
+                BeginDrawerClose();
             });
 
             // 遮罩与面板都从顶栏下方开始：顶栏（标题/钱包/菜单/窗口按钮）始终可见可点
@@ -382,17 +453,17 @@ namespace TomatoFocus.Ui
             pt.FillRound(panel, 0, t.Surface);
 
             var inner = new RectangleF(panel.Left + 22, panel.Top + 20, panel.Width - 44, panel.Height - 40);
-            string title = _drawer == "menu" ? I18n.T("menu.title")
-                : _drawer == "day" ? I18n.T("cal.dayDetail", DayKey.Parse(_dayKey).Month, DayKey.Parse(_dayKey).Day)
+            string title = kind == "menu" ? I18n.T("menu.title")
+                : kind == "day" ? I18n.T("cal.dayDetail", DayKey.Parse(dayKey).Month, DayKey.Parse(dayKey).Day)
                 : "";
 
             pt.TextLeft(title, pt.F(17f, true), t.Text, new RectangleF(inner.Left, inner.Top, inner.Width - 40, 30));
             DrawIconButton(pt, "drawerClose", new RectangleF(inner.Right - 32, inner.Top, 32, 30), "close", false,
-                delegate { _drawer = ""; _dayKey = ""; _dirty = true; });
+                delegate { BeginDrawerClose(); });
 
             // 菜单抽屉：顶部三段式切换（成就 / 奖励 / 设置）
             float contentTop = inner.Top + 42;
-            if (_drawer == "menu")
+            if (kind == "menu")
             {
                 string[] tabs = { "achievements", "rewards", "settings" };
                 string[] tabKeys = { "ach.title", "reward.title", "settings.title" };
@@ -407,7 +478,9 @@ namespace TomatoFocus.Ui
                     pt.TextCenter(I18n.T(tabKeys[i]), pt.F(12f, true),
                         active ? Color.White : Theme.Blend(t.TextMuted, t.Text, hv), seg);
                     string tab = tabs[i];
-                    Hot("tab" + tabs[i], seg, delegate { _menuTab = tab; _drawerScroll = 0; _dirty = true; });
+                    // 关闭动画期间不接受切换，避免"边收边换页"
+                    if (open) Hot("tab" + tabs[i], seg, delegate { _menuTab = tab; _drawerScroll = 0; _dirty = true; });
+                    else Hot("tab" + tabs[i], seg, null, true, true);
                 }
                 contentTop += 44;
             }
@@ -423,27 +496,35 @@ namespace TomatoFocus.Ui
             _hotClipActive = true;
             pt.Clip(body, delegate
             {
-                if (_drawer == "day") { contentH = DrawDayDetail(pt, body, _drawerScroll); return; }
+                if (kind == "day") { contentH = DrawDayDetail(pt, body, scroll, dayKey); return; }
                 switch (_menuTab)
                 {
-                    case "achievements": contentH = DrawAchievements(pt, body, _drawerScroll); break;
-                    case "rewards": contentH = DrawRewards(pt, body, _drawerScroll); break;
-                    case "settings": contentH = DrawSettings(pt, body, _drawerScroll); break;
+                    case "achievements": contentH = DrawAchievements(pt, body, scroll); break;
+                    case "rewards": contentH = DrawRewards(pt, body, scroll); break;
+                    case "settings": contentH = DrawSettings(pt, body, scroll); break;
                 }
             });
             _hotClipActive = false;
+            // 关闭动画期间内容只是"画面"：整块吞掉点击，避免滑动中误触兑换 / 切换标签
+            if (!open) Hot("drawerClosing", fullBody, null, true, true);
 
             // 滚动条：绘制在预留槽内，命中优先级最高
             if (contentH > fullBody.Height + 1f)
             {
                 float maxScroll = contentH - fullBody.Height;
-                _drawerMaxScroll = maxScroll;           // 供滚轮/拖动当场钳制
-                if (_scrollToEnd) { _scrollTarget = maxScroll; _scrollToEnd = false; }   // 新内容出现时平滑滚到底
-                if (_drawerScroll > maxScroll) _drawerScroll = maxScroll;
-                if (_drawerScroll < 0) _drawerScroll = 0;
+                if (open)
+                {
+                    _drawerMaxScroll = maxScroll;           // 供滚轮/拖动当场钳制
+                    if (_scrollToEnd) { _scrollTarget = maxScroll; _scrollToEnd = false; }   // 新内容出现时平滑滚到底
+                    if (_drawerScroll > maxScroll) _drawerScroll = maxScroll;
+                    if (_drawerScroll < 0) _drawerScroll = 0;
+                    scroll = _drawerScroll;
+                }
+                else if (scroll > maxScroll) scroll = maxScroll;   // 关闭期间只做视觉钳制，不改真实状态
+                if (scroll < 0f) scroll = 0f;
 
                 float thumbH = Math.Max(40f, fullBody.Height * fullBody.Height / contentH);
-                float thumbY = fullBody.Top + (fullBody.Height - thumbH) * (_drawerScroll / maxScroll);
+                float thumbY = fullBody.Top + (fullBody.Height - thumbH) * (scroll / maxScroll);
                 var track = new RectangleF(fullBody.Right - 12f, fullBody.Top, 12f, fullBody.Height);
                 var thumb = new RectangleF(track.Left + 4f, thumbY, 5f, thumbH);
                 bool active = _pressedId == "scrollBar";
@@ -452,18 +533,20 @@ namespace TomatoFocus.Ui
                 pt.FillRound(thumb, 2.5f, Theme.Alpha(t.TextMuted, active ? 200 : 115));
 
                 float bodyH = fullBody.Height, th = thumbH, ms = maxScroll, trackTop = track.Top;
-                Hot("scrollBar", track, delegate
-                {
-                    float ratio = (_clickPoint.Y - trackTop - th / 2f) / Math.Max(1f, bodyH - th);
-                    _drawerScroll = Math.Max(0f, Math.Min(ms, ratio * ms));
-                    _dirty = true;
-                }, true, false, delegate (PointF p)
-                {
-                    float ratio = (p.Y - trackTop - th / 2f) / Math.Max(1f, bodyH - th);
-                    _drawerScroll = Math.Max(0f, Math.Min(ms, ratio * ms));
-                });
+                if (open)
+                    Hot("scrollBar", track, delegate
+                    {
+                        float ratio = (_clickPoint.Y - trackTop - th / 2f) / Math.Max(1f, bodyH - th);
+                        _drawerScroll = Math.Max(0f, Math.Min(ms, ratio * ms));
+                        _dirty = true;
+                    }, true, false, delegate (PointF p)
+                    {
+                        float ratio = (p.Y - trackTop - th / 2f) / Math.Max(1f, bodyH - th);
+                        _drawerScroll = Math.Max(0f, Math.Min(ms, ratio * ms));
+                    });
+                else Hot("scrollBar", track, null, true, true);
             }
-            else { _drawerScroll = 0; _drawerMaxScroll = 0; _scrollToEnd = false; }
+            else if (open) { _drawerScroll = 0; _drawerMaxScroll = 0; _scrollToEnd = false; }
         }
 
         private float DrawAchievements(Painter pt, RectangleF body, float scroll)
@@ -552,7 +635,8 @@ namespace TomatoFocus.Ui
                 var row = new RectangleF(body.Left, y, body.Width, 60);
                 if (row.Bottom > body.Top && row.Top < body.Bottom)
                 {
-                    bool owned = _app.Data.Rewards.IsOwned(def.Id);
+                    // 默认主题 / 默认提示音（0 成本）永远视为已拥有：不再显示"兑换 0 颗"
+                    bool owned = Rewards.IsOwnedOrDefault(_app.Data, def);
                     bool equipped = Rewards.IsEquipped(_app.Data, def);
                     pt.FillRound(row, 12f, equipped ? Theme.Alpha(t.AccentSoft, 170) : t.SurfaceAlt);
 
@@ -644,6 +728,13 @@ namespace TomatoFocus.Ui
                     s.Sound = v;
                     _app.MarkDirty();
                     if (v) Sound.Play(Rewards.SoundIdFor(_app.Data), true);   // 打开时试听一次
+                });
+            y = ToggleRow(pt, body, y, "tgGreet", I18n.T("settings.greeting"), I18n.T("settings.greeting.hint"), s.GreetingOn,
+                delegate (bool v)
+                {
+                    s.GreetingOn = v;
+                    if (!v) _app.DismissGreeting();      // 关掉时顺手收起正在显示的问候
+                    _app.MarkDirty();
                 });
 
             y = SectionTitle(pt, body, y, I18n.T("settings.breakSeconds"));
@@ -820,12 +911,12 @@ namespace TomatoFocus.Ui
             return y + h;
         }
 
-        private float DrawDayDetail(Painter pt, RectangleF body, float scroll)
+        private float DrawDayDetail(Painter pt, RectangleF body, float scroll, string dayKey)
         {
             var t = pt.T;
             float y = body.Top - scroll;
-            var list = Stats.SessionsOf(_app.Data, _dayKey);
-            var day = Stats.DayOf(_app.Data, _dayKey);
+            var list = Stats.SessionsOf(_app.Data, dayKey);
+            var day = Stats.DayOf(_app.Data, dayKey);
 
             pt.Text(I18n.T("today.tomatoes", TomatoMath.Format(day == null ? 0 : day.Tenths)) + " · " +
                     I18n.T("cal.sessions", list.Count), pt.F(12.5f, true), t.Text, new RectangleF(body.Left, y, body.Width, 20));
@@ -924,6 +1015,50 @@ namespace TomatoFocus.Ui
                 ShowToast(I18n.T(_app.KeepLastNote() ? "break.keepNote.done" : "break.keepNote.none"));
                 _app.DismissReminder();
             });
+        }
+
+        // --- 分时段温馨问候卡 ----------------------------------------------
+        private void DrawGreetingCard(Painter pt)
+        {
+            var g = _app.PendingGreeting;
+            A("greeting", 0f, 12f).Set(g != null ? 1f : 0f);
+            float k = A("greeting").Value;
+            if (k < 0.01f || g == null) return;
+
+            var t = pt.T;
+            var b = Bounds;
+            float w = Math.Min(520f, b.Width - 80f);
+            float h = 132f;
+            var card = new RectangleF(b.Width / 2f - w / 2f, b.Height - h - 28 - (1 - k) * 24, w, h);
+
+            pt.Shadow(card, 20f, 12f, t.Shadow);
+            pt.FillRound(card, 20f, t.Surface);
+            pt.StrokeRound(card, 20f, Theme.Alpha(t.Accent, 70), 1.2f);
+
+            TomatoArt.Icon(pt, new RectangleF(card.Left + 22, card.Top + 22, 30, 30));
+            pt.Text(I18n.T(g.TitleKey), pt.F(15f, true), t.Text,
+                new RectangleF(card.Left + 62, card.Top + 18, card.Width - 84, 24));
+            pt.Text(I18n.T(g.PhraseKey), pt.F(13.5f), t.AccentDark,
+                new RectangleF(card.Left + 62, card.Top + 46, card.Width - 84, 24));
+
+            float by = card.Bottom - 48;
+            var ok = new RectangleF(card.Right - 22 - 96, by, 96, 34);
+            pt.FillRound(ok, 17f, t.SurfaceAlt);
+            pt.TextCenter(I18n.T("greet.action.ok"), pt.F(12f, true), t.TextMuted, ok);
+            Hot("greetOk", ok, delegate { _app.DismissGreeting(); _dirty = true; });
+
+            if (!string.IsNullOrEmpty(g.PrimaryKey))
+            {
+                var go = new RectangleF(ok.Left - 10 - 130, by, 130, 34);
+                pt.FillRound(go, 17f, t.Accent);
+                pt.TextCenter(I18n.T(g.PrimaryKey), pt.F(12f, true), Color.White, go);
+                Hot("greetGo", go, delegate
+                {
+                    _app.DismissGreeting();
+                    ToggleStartPause();       // 直接开始本轮专注
+                    _dirty = true;
+                });
+            }
         }
 
         // --- 中断确认（行内，不弹窗） --------------------------------------

@@ -23,6 +23,9 @@ namespace TomatoFocus.Core
         public string NoteDraft = "";           // 笔记草稿：结算时写入该次会话
         public int RewardBadgeSeen = 0;         // 已读的"可兑换奖励"数量（红点用）
         public bool ShowYearView = false;
+        public bool GreetingOn = true;          // 分时段温馨问候（默认开）
+        public string LastGreetDay = "";        // 最近一次问候的日期（yyyy-MM-dd）
+        public string LastGreetPeriod = "";     // 最近一次问候的时段标识
     }
 
     /// <summary>一次专注会话的如实记录。</summary>

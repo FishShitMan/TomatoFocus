@@ -1,6 +1,8 @@
 # 番茄专注 TomatoFocus
 
-一个轻量的 Windows 桌面番茄钟。**单个 exe，约 170 KB，零运行时依赖**（Win10/11 自带 .NET Framework 4.8），
+> Github仓库：https://github.com/FishShitMan/TomatoFocus
+
+一个轻量的 Windows 桌面番茄钟。**单个 exe，约 247 KB，零运行时依赖**（Win10/11 自带 .NET Framework 4.8），
 所有界面、图形、动效、音效**全部由代码程序化生成**，不依赖任何图片或音频文件。
 
 ---
@@ -9,7 +11,7 @@
 
 ```powershell
 powershell -File build.ps1 -Run      # 编译并启动
-powershell -File build.ps1 -Test     # 编译并跑测试（289 项）
+powershell -File build.ps1 -Test     # 编译并跑测试（721 项）
 powershell -File build.ps1 -Sheet    # 渲染界面快照到 build\dev\snapshots\
 ```
 
@@ -51,6 +53,7 @@ powershell -File build.ps1 -Sheet    # 渲染界面快照到 build\dev\snapshots
 | 极简模式 | 窗口收纳进托盘，功能只在右键菜单里提供；双击托盘图标可临时唤出窗口 |
 | 开机自启 | 写入 HKCU 的 Run 项，无需管理员，**默认关闭** |
 | 关怀提醒 | 每个专注区间结束弹出起身活动卡片，42 条关怀语句随机轮换；设置里的「休息时长」（5/10/15/20 分钟）**只影响这张卡片建议的休息时间**；卡片的「**保留笔记**」会把上一轮保存的笔记恢复到草稿，方便在原内容上继续续写 |
+| 温馨问候 | 早起 05:00–09:00 / 午间 11:30–13:30 / 下午 14:00–17:30 / 夜深 22:30–05:00 四个时段各问候一次；**不打断专注**（计时中自动延后），12 秒自动消失，窗口在托盘时改走系统气泡；设置里可关（默认开） |
 | 国际化 | 默认简体中文；文案全部在 `Lang/*.json`，英文版只需补文件 |
 | 图片接口 | `assets/` 放图即替换程序化绘制，删图即回退，支持热重载 |
 
@@ -117,5 +120,5 @@ src/Tray/     托盘控制器、程序化托盘图标、ICO 打包
 src/Assets/   图片接口（manifest + 热重载 + 回退）
 Lang/         语言包（编译期嵌入，也可放在 exe 同目录覆盖）
 assets/       可选的图片覆盖槽位
-tests/        测试运行器与 233 项断言
+tests/        测试运行器与 721 项断言
 ```

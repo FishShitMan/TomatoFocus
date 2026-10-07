@@ -1,6 +1,6 @@
 ﻿番茄专注 TomatoFocus
 ========================================
-本目录只需要 TomatoFocus.exe 即可运行：
+本目录只需要 番茄专注.exe 即可运行：
   - 单文件，无需安装，无需额外运行时（Win10/11 自带 .NET Framework 4.8）
   - 双击启动；关闭窗口默认最小化到托盘
   - 托盘图标右键菜单提供全部功能（含极简模式、开机自启）
@@ -9,4 +9,4 @@
 可选美化：把 PNG 放进 assets\ 目录即可替换程序化绘制的图标（删掉即回退）
 语言包覆盖：在 exe 同目录建 Lang\zh-CN.json 可覆盖内置文案
 
-更多说明见项目根目录 README.md
+Github仓库：https://github.com/FishShitMan/TomatoFocus

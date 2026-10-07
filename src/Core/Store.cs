@@ -104,6 +104,9 @@ namespace TomatoFocus.Core
             w.Name("lastPresetId").Value(s.LastPresetId ?? "");
             w.Name("noteDraft").Value(s.NoteDraft);
             w.Name("rewardBadgeSeen").Value(s.RewardBadgeSeen);
+            w.Name("greetingOn").Value(s.GreetingOn);
+            w.Name("lastGreetDay").Value(s.LastGreetDay ?? "");
+            w.Name("lastGreetPeriod").Value(s.LastGreetPeriod ?? "");
             w.Name("customPresets").BeginArray();
             foreach (int p in s.CustomPresets) w.Value(p);
             w.EndArray();
@@ -195,6 +198,9 @@ namespace TomatoFocus.Core
             s.LastPresetId = so.Str("lastPresetId", "");
             s.NoteDraft = so.Str("noteDraft", "");
             s.RewardBadgeSeen = so.Int("rewardBadgeSeen");
+            s.GreetingOn = so.Bool("greetingOn", true);
+            s.LastGreetDay = so.Str("lastGreetDay", "");
+            s.LastGreetPeriod = so.Str("lastGreetPeriod", "");
             s.CustomPresets = new List<int>();
             foreach (object o in so.Arr("customPresets"))
             {

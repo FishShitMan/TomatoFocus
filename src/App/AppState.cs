@@ -16,6 +16,15 @@ namespace TomatoFocus.Core
         public int BreakSeconds = 300;
     }
 
+    /// <summary>一次待展示的分时段温馨问候。</summary>
+    internal sealed class Greeting
+    {
+        public string Period = "";          // morning / noon / afternoon / night
+        public string TitleKey = "";
+        public string PhraseKey = "";
+        public string PrimaryKey = "";      // 主按钮文案键（空 = 只显示「知道了」）
+    }
+
     /// <summary>应用状态门面：数据 + 计时器 + 主题 + 提醒规则。</summary>
     internal sealed class AppState
     {
@@ -32,6 +41,8 @@ namespace TomatoFocus.Core
         public event EventHandler<List<AchievementDef>> AchievementsUnlocked;
         public event EventHandler<SessionRecord> SessionRecorded;
         public event EventHandler ReminderRequested;
+        /// <summary>需要展示一次温馨问候（窗口可见时弹卡片，隐藏时走托盘气泡）。</summary>
+        public event EventHandler GreetingRequested;
         /// <summary>极简模式开关变化（设置页与托盘菜单共用这一条路径）。</summary>
         public event EventHandler MinimalModeChanged;
         /// <summary>每秒一次的节拍（供托盘提示等低频刷新使用）。</summary>
@@ -113,9 +124,71 @@ namespace TomatoFocus.Core
                 var h = ClockTick;
                 if (h != null) h(this, EventArgs.Empty);
             }
+            CheckGreeting(DateTime.Now);
         }
 
         private int _lastClockSecond = -1;
+
+        // --- 分时段温馨问候 -------------------------------------------------
+        /// <summary>待展示的问候（null 表示没有）。</summary>
+        public Greeting PendingGreeting;
+
+        private static readonly Random GreetRng = new Random(Environment.TickCount);
+
+        /// <summary>
+        /// 每秒检查一次：进入某个问候时段、且当天该时段还没问候过，就安排一次问候。
+        /// **不打断专注**：计时/休息中、或关怀提醒卡正在显示时，留到下一个节拍再判（本轮结束后自然会弹）。
+        /// </summary>
+        public void CheckGreeting(DateTime now)
+        {
+            if (!Data.Settings.GreetingOn) return;
+            if (PendingGreeting != null) return;
+
+            var period = HealthRules.PeriodOf(now);
+            if (period == GreetingPeriod.None) return;
+
+            string key = HealthRules.PeriodKey(period);
+            if (Data.Settings.LastGreetDay == DayKey.Today && Data.Settings.LastGreetPeriod == key) return;
+
+            if (Timer.Phase != TimerPhase.Idle) return;     // 计时/休息中：不打断
+            if (Pending != null) return;                    // 提醒卡正在显示：不叠加
+
+            ShowGreeting(period, DayKey.Today);
+        }
+
+        /// <summary>安排一次问候（记录"今天该时段已问候"，保证每段每天只弹一次）。</summary>
+        public void ShowGreeting(GreetingPeriod period, string day)
+        {
+            var g = new Greeting();
+            g.Period = HealthRules.PeriodKey(period);
+            g.TitleKey = "greet." + g.Period + ".title";
+            g.PhraseKey = PickGreetingPhrase(g.Period);
+            // 只有早上的问候才附带「开始专注」，夜里不该鼓励继续干活
+            g.PrimaryKey = period == GreetingPeriod.Morning ? "greet.action.focus" : "";
+
+            PendingGreeting = g;
+            Data.Settings.LastGreetDay = day;
+            Data.Settings.LastGreetPeriod = g.Period;
+            MarkDirty();
+
+            var h = GreetingRequested;
+            if (h != null) h(this, EventArgs.Empty);
+        }
+
+        public void DismissGreeting()
+        {
+            if (PendingGreeting == null) return;
+            PendingGreeting = null;
+            MarkDirty();
+        }
+
+        /// <summary>随机取一条该时段的问候语句键（语句不足时回退到第 1 条）。</summary>
+        private static string PickGreetingPhrase(string period)
+        {
+            string key = "greet." + period + "." + GreetRng.Next(1, 4);
+            if (I18n.T(key) == key) key = "greet." + period + ".1";
+            return key;
+        }
 
         public bool Save()
         {
@@ -327,6 +400,14 @@ namespace TomatoFocus.Core
             Data.Counters.Clear();
             Data.Wallet = new Wallet();
             Data.Settings.NoteDraft = "";          // 当前笔记属于工作数据，一并清掉
+            Data.Settings.LastGreetDay = "";       // 问候记录也清掉：清空数据后当天可以重新问候
+            Data.Settings.LastGreetPeriod = "";
+            PendingGreeting = null;
+            // 兑换状态被整体重置了：默认主题 / 默认提示音本来就无需兑换，必须回到"装备中"，
+            // 否则奖励页会把它们画成"兑换 0 颗"、汉堡还会多出一个假红点。
+            // 这里不能用 Store.Normalize —— 那会连"设置"一起改掉，而本操作明确要保留设置。
+            Data.Rewards.EquippedTheme = "th_fresh";
+            Data.Rewards.EquippedSound = "sn_default";
             Store.RebuildDays(Data);
             Achievements.Evaluate(Data, DateTime.Now);
             Save();

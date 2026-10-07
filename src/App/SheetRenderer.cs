@@ -177,6 +177,14 @@ namespace TomatoFocus.App
                 LastUi.Draw(LastGraphics);
                 if (ClickChip(LastUi, "presetCustom")) LastUi.TypeDigits("40");
             });
+            // 分时段温馨问候卡（早起档：带「开始专注」）
+            count += Shot(app, Path.Combine(outDir, "21-greeting.png"), delegate
+            {
+                LastUi.SetDrawer("");
+                app.Timer.Reset();
+                app.DismissReminder();
+                app.ShowGreeting(GreetingPeriod.Morning, DayKey.Today);
+            });
             return count;
         }
 
@@ -250,6 +258,10 @@ namespace TomatoFocus.App
             }
 
             Store.RebuildDays(d);
+            // 与真机一致：默认主题 / 默认提示音按"已拥有 + 装备中"显示（否则快照里是"兑换 0 颗"）
+            d.Rewards.Owned.Add("th_fresh");
+            d.Rewards.Owned.Add("sn_default");
+            if (string.IsNullOrEmpty(d.Rewards.EquippedSound)) d.Rewards.EquippedSound = "sn_default";
             d.Wallet.SpentWhole = Math.Max(0, Math.Min(d.Wallet.UsableWhole, 3));
             d.Rewards.Owned.Add("t_farmer");
             d.Rewards.EquippedTitle = "t_farmer";

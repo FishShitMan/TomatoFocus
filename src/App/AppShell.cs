@@ -36,6 +36,7 @@ namespace TomatoFocus.App
             _app.Changed += OnAppChanged;
             _app.MinimalModeChanged += delegate { ApplyMinimalMode(); };
             _app.ClockTick += delegate { _tray.Refresh(); };   // 悬停提示里的剩余时间逐秒刷新
+            _app.GreetingRequested += OnGreetingRequested;
 
             _form = new MainForm(_app);
             _form.HideToTrayRequested += delegate { HideToTray(); };
@@ -220,6 +221,22 @@ namespace TomatoFocus.App
         private void OnToast(object sender, string message)
         {
             if (_form != null && _form.Visible) _form.Ui.ShowToast(message);
+        }
+
+        /// <summary>温馨问候：窗口可见时弹卡片（12 秒自动消失），已收纳托盘时走系统气泡。</summary>
+        private void OnGreetingRequested(object sender, EventArgs e)
+        {
+            var g = _app.PendingGreeting;
+            if (g == null) return;
+            if (_form != null && _form.Visible)
+            {
+                _form.Invalidate();                       // 卡片带有淡入动效，这里触发一帧即可
+            }
+            else
+            {
+                _tray.ShowBalloon(I18n.T(g.TitleKey), I18n.T(g.PhraseKey));
+                _app.DismissGreeting();                   // 气泡没有按钮，直接结束这次问候
+            }
         }
 
         private void OnAchievementsUnlocked(object sender, List<AchievementDef> list)

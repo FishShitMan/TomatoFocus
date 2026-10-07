@@ -73,6 +73,11 @@ namespace TomatoFocus.Ui
 
         private string _drawer = "";
         private string _menuTab = "achievements";
+        // 关闭动画快照：抽屉一开始收起就冻结"刚才那一页"的内容与滚动位置，
+        // 关闭过程中只有横向位移——不串页、不错位、标题也不会提前消失。
+        private string _closingDrawer = "";
+        private string _closingDayKey = "";
+        private float _closingScroll;
         private string _mode = "focus";        // focus | break
         private float _modeK;                  // 胶囊滑动进度 0=专注 1=休息（配色渐变共用）
         private int _breakPresetMinutes = 5;
@@ -117,6 +122,10 @@ namespace TomatoFocus.Ui
                 return false;
             }
         }
+
+        /// <summary>温馨问候的自动消失时长（秒）。</summary>
+        private const double GreetAutoDismissSeconds = 12.0;
+        private double _greetT;
 
         /// <summary>触发一次短时高帧率（用于窗口显示、装备奖励等时刻的动效）。</summary>
         public void Pulse() { Burst(); _dirty = true; }
@@ -216,6 +225,7 @@ namespace TomatoFocus.Ui
                 if (_ambientMedals.Count == 0) return false;
                 if (_debugOpen || _confirmStop) return false;
                 if (_app.Pending != null) return false;
+                if (_app.PendingGreeting != null) return false;   // 问候卡在动：需要整窗重绘
                 if (_toastT > 0) return false;
                 // 笔记聚焦不再排除：光标已改为独立细条，快路径会连它一起擦/画
                 return true;
@@ -370,6 +380,19 @@ namespace TomatoFocus.Ui
                 if (_toastT <= 0) _toast = "";
             }
             if (InteractionBurst > 0) InteractionBurst -= realDt;
+
+            // 温馨问候自动消失（不强制点击），12 秒后自行淡出
+            if (_app.PendingGreeting != null)
+            {
+                _greetT += realDt;
+                if (_greetT >= GreetAutoDismissSeconds)
+                {
+                    _greetT = 0;
+                    _app.DismissGreeting();
+                    _dirty = true;
+                }
+            }
+            else _greetT = 0;
             var open = !string.IsNullOrEmpty(_drawer);
             A("drawer", 0f, 13f).Set(open ? 1f : 0f);
 
@@ -562,7 +585,7 @@ namespace TomatoFocus.Ui
                 }
                 else
                 {
-                    _viewMonth = _viewMonth.AddMonths(delta > 0 ? 1 : -1);
+                    ShiftView(delta > 0 ? 1 : -1);
                 }
                 _dirty = true;
                 Burst();
@@ -610,7 +633,7 @@ namespace TomatoFocus.Ui
 
             if (!string.IsNullOrEmpty(_drawer))
             {
-                if (key == Keys.Escape) { _drawer = ""; _dayKey = ""; _dirty = true; }
+                if (key == Keys.Escape) BeginDrawerClose();
                 return;
             }
 
@@ -625,8 +648,8 @@ namespace TomatoFocus.Ui
                 case Keys.Escape:
                     if (_app.Timer.Phase == TimerPhase.Focusing) _app.Timer.Pause();
                     break;
-                case Keys.Left: _viewMonth = _viewMonth.AddMonths(-1); break;
-                case Keys.Right: _viewMonth = _viewMonth.AddMonths(1); break;
+                case Keys.Left: ShiftView(-1); break;
+                case Keys.Right: ShiftView(1); break;
             }
             _dirty = true;
             Burst();
@@ -754,6 +777,7 @@ namespace TomatoFocus.Ui
             ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             DrawConfirmBar(pt);
             DrawReminderCard(pt);
+            DrawGreetingCard(pt);
             DrawDrawer(pt);      // 抽屉永远在最上层，避免层级与热区错乱
             DrawToast(pt);
             DrawDebugPanel(pt);
@@ -961,9 +985,34 @@ namespace TomatoFocus.Ui
         /// <summary>鼠标是否悬停在可点击元素上（用于切换手型光标）。</summary>
         public bool HoverClickable { get; private set; }
 
+        /// <summary>
+        /// 开始收起抽屉：先把当前内容（种类 / 日期 / 滚动位置）冻结成快照，再清空状态。
+        /// 关闭动画期间画面照旧，于是只剩面板横向滑出，不会出现"内容先错位再右收"。
+        /// </summary>
+        private void BeginDrawerClose()
+        {
+            if (!string.IsNullOrEmpty(_drawer))
+            {
+                _closingDrawer = _drawer;
+                _closingDayKey = _dayKey;
+                _closingScroll = _drawerScroll;
+            }
+            _drawer = "";
+            _dayKey = "";
+            _dirty = true;
+        }
+
+        /// <summary>日历翻页：月视图翻月，年视图翻年（右上箭头、滚轮、左右键共用同一口径）。</summary>
+        private void ShiftView(int dir)
+        {
+            if (dir == 0) return;
+            _viewMonth = _yearView ? _viewMonth.AddYears(dir) : _viewMonth.AddMonths(dir);
+            _dirty = true;
+        }
+
         private void ToggleDrawer(string name)
         {
-            if (_drawer == name) { _drawer = ""; _dayKey = ""; }
+            if (_drawer == name) { BeginDrawerClose(); }
             else { _drawer = name; _dayKey = ""; _drawerScroll = 0; }
             _clearStage = 0;
             _noteFocus = false;
@@ -1045,11 +1094,15 @@ namespace TomatoFocus.Ui
         public void SetClearStage(int stage) { _clearStage = stage < 0 ? 0 : stage; _holdProgress = 0f; _dirty = true; }
 
         /// <summary>收起抽屉（例如切到极简模式前）。</summary>
-        public void CloseDrawer() { _drawer = ""; _dayKey = ""; _clearStage = 0; _holdProgress = 0f; _scrollTarget = -1f; _dirty = true; }
+        public void CloseDrawer() { BeginDrawerClose(); _clearStage = 0; _holdProgress = 0f; _scrollTarget = -1f; }
         public void SetViewMonth(DateTime month) { _viewMonth = new DateTime(month.Year, month.Month, 1); _dirty = true; }
         public void SetYearView(bool on) { _yearView = on; _dirty = true; }
         public string CurrentDrawer { get { return _drawer; } }
+        /// <summary>当前"正在画"的抽屉种类：关闭动画期间仍返回刚才那一页。</summary>
+        public string CurrentDrawerKind { get { return string.IsNullOrEmpty(_drawer) ? _closingDrawer : _drawer; } }
         public string CurrentMenuTab { get { return _menuTab; } }
+        public DateTime ViewMonth { get { return _viewMonth; } }
+        public bool IsYearView { get { return _yearView; } }
         public bool IsCustomInputActive { get { return _customFocus; } }
         public string CustomInputText { get { return _customInput; } }
         public float DrawerScroll { get { return _drawerScroll; } }
@@ -1253,8 +1306,7 @@ namespace TomatoFocus.Ui
                     var secondary = new RectangleF(pairLeft + pairW - secondaryW, btnTop, secondaryW, btnH);
                     DrawGhostButton(pt, "btnStop", secondary, I18n.T("focus.stop"), "stop", delegate
                     {
-                        _drawer = "";
-                        _dayKey = "";
+                        BeginDrawerClose();
                         _confirmStop = true;
                         _dirty = true;
                     }, showStop);

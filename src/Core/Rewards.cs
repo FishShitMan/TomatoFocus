@@ -132,9 +132,15 @@ namespace TomatoFocus.Core
             {
                 case "title": return data.Rewards.EquippedTitle == def.Id;
                 case "medal": return data.Rewards.EquippedMedal == def.Id;
-                case "theme": return data.Rewards.EquippedTheme == def.Id;
+                case "theme":
+                    // 没有装备任何主题时，默认主题就是当前生效的那个
+                    // （Normalize 之前、清空数据之后也必须成立，否则会显示成"兑换 0 颗"）
+                    return data.Rewards.EquippedTheme == def.Id
+                        || (string.IsNullOrEmpty(data.Rewards.EquippedTheme) && def.Id == "th_fresh");
                 case "effect": return data.Rewards.EquippedEffect == def.Id;
-                case "sound": return data.Rewards.EquippedSound == def.Id;
+                case "sound":
+                    return data.Rewards.EquippedSound == def.Id
+                        || (string.IsNullOrEmpty(data.Rewards.EquippedSound) && def.Id == "sn_default");
                 default: return false;
             }
         }
@@ -189,12 +195,18 @@ namespace TomatoFocus.Core
             return id == "th_fresh" || id == "sn_default";
         }
 
-        /// <summary>当前"可兑换但尚未拥有"的数量（汉堡红点判定口径）。</summary>
+        /// <summary>是否可用（默认项永远视为已拥有，无需兑换）。列表按钮与判定共用这一口径。</summary>
+        public static bool IsOwnedOrDefault(AppData data, RewardDef def)
+        {
+            return def != null && (IsDefault(def.Id) || data.Rewards.IsOwned(def.Id));
+        }
+
+        /// <summary>当前"可兑换但尚未拥有"的数量（汉堡红点判定口径）。默认项不计入。</summary>
         public static int AffordableUnowned(AppData data)
         {
             int n = 0;
             foreach (var d in Defs)
-                if (!data.Rewards.IsOwned(d.Id) && data.Wallet.CanAfford(d.Cost)) n++;
+                if (!IsDefault(d.Id) && !data.Rewards.IsOwned(d.Id) && data.Wallet.CanAfford(d.Cost)) n++;
             return n;
         }
     }
