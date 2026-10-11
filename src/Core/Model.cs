@@ -163,7 +163,25 @@ namespace TomatoFocus.Core
 
     internal static class DayKey
     {
-        public static string Of(DateTime local) { return local.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture); }
+        // (年*10000 + 月*100 + 日) → "yyyy-MM-dd" 的备忘表。
+        // 这本来是个纯函数，但日历每帧都要按天取键：月视图 2×31 次、年视图 2×365 次
+        // ToString 格式化 + 字符串分配——整窗重绘时全是重复劳动，弱 CPU 上尤其明显。
+        private static readonly Dictionary<int, string> Cache = new Dictionary<int, string>();
+        private static readonly object CacheLock = new object();
+
+        public static string Of(DateTime local)
+        {
+            int k = local.Year * 10000 + local.Month * 100 + local.Day;
+            lock (CacheLock)
+            {
+                string hit;
+                if (Cache.TryGetValue(k, out hit)) return hit;
+                string s = local.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                if (Cache.Count > 8192) Cache.Clear();   // 安全网：正常使用远达不到
+                Cache[k] = s;
+                return s;
+            }
+        }
         public static string Today { get { return Of(DateTime.Now); } }
         public static DateTime Parse(string key)
         {

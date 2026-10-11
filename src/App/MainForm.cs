@@ -102,6 +102,7 @@ namespace TomatoFocus.App
 
         private void PumpLoop()
         {
+            int lastPost = Environment.TickCount;
             while (!_pumpStop)
             {
                 // 高帧率档补掉约 2ms 的调度开销（Sleep 返回 + 消息投递 + WM_PAINT 派发），
@@ -116,19 +117,47 @@ namespace TomatoFocus.App
 
                 if (Interlocked.CompareExchange(ref _framePending, 1, 0) == 0)
                 {
+                    lastPost = Environment.TickCount;
                     try
                     {
                         if (IsHandleCreated)
                         {
                             if (PerfProbe.Active != null) PerfProbe.Posts++;
-                            Native.PostMessage(Handle, WM_FRAME, IntPtr.Zero, IntPtr.Zero);
+                            // 投递失败也必须立刻复位，否则背压标记会永久停在 1（同一个坑）
+                            if (!Native.PostMessage(Handle, WM_FRAME, IntPtr.Zero, IntPtr.Zero))
+                                Interlocked.Exchange(ref _framePending, 0);
                         }
                         else Interlocked.Exchange(ref _framePending, 0);
                     }
                     catch { Interlocked.Exchange(ref _framePending, 0); }
                 }
+                else
+                {
+                    // 看门狗兜底：WM_FRAME 只在 WndProc 里被消费时才复位背压标记，
+                    // 一旦这条消息以任何方式丢失（句柄被重建、队列被清空…），标记就会永远停在 1，
+                    // 渲染泵从此一帧都不再投递 —— 整个程序卡死，连倒计时都不走。
+                    // 这里给"投递后长时间没人消费"设一条底线，宁可多发一帧也绝不允许泵停摆。
+                    int quiet = unchecked(Environment.TickCount - lastPost);
+                    if (quiet > PumpStallMs)
+                    {
+                        Interlocked.Exchange(ref _framePending, 0);
+                        _pumpStalls++;
+                        Log.Info("renderPump: 帧消息 " + quiet + "ms 未被消费，已强制复位（累计 " + _pumpStalls + " 次）");
+                    }
+                }
             }
         }
+
+        /// <summary>投递后多久没被消费就认为消息已丢失（毫秒）。正常队列延迟在 100ms 以内。</summary>
+        private const int PumpStallMs = 2000;
+
+        private int _pumpStalls;
+        /// <summary>诊断用：渲染泵因消息丢失而强制复位的次数（正常应恒为 0）。</summary>
+        public int PumpStalls { get { return _pumpStalls; } }
+
+        private int _loopTicks;
+        /// <summary>诊断用：渲染循环已执行的帧数。停止增长即说明渲染泵停摆。</summary>
+        public int LoopTicks { get { return _loopTicks; } }
 
         public void ApplyIcon()
         {
@@ -192,6 +221,7 @@ namespace TomatoFocus.App
 
         private void OnLoop(object sender, EventArgs e)
         {
+            _loopTicks++;
             // 用 QPC 计时：DateTime.UtcNow 在 Windows 上只有约 15.6ms 分辨率，会导致动画一顿一顿
             double now = _frameClock.Elapsed.TotalSeconds;
             double realDt = now - _lastFrameTime;
@@ -239,16 +269,46 @@ namespace TomatoFocus.App
             bool secondChanged = sec != _lastPaintSecond;
             bool uiDirty = _ui.TakeDirty();
 
+            // 本帧是否**必须**整窗重绘：有动画在跑、动画刚结束（要擦掉最后一帧残留）、
+            // 界面状态变化、或秒数变了（时钟与进度环每秒才变一次）。
+            // 把"是否必须整窗重绘"独立出来，是为了让计时中也能安全走快路径。
+            bool needFullRedraw = animating || _wasAnimating || uiDirty || secondChanged;
+
             // 帧率策略；_frameInterval 由渲染泵线程读取，改档无需重建计时器。
-            // 只有勋章在变时走"勋章快路径"：贴缓存 + 只重画那几枚勋章（实测约 3.8ms），
-            // 因此可以给到 30fps；整窗重绘的帧才需要退回低频档。
+            // 只有勋章在变时走"勋章快路径"：贴缓存 + 只重画那几枚勋章，因此可以给到 30fps。
             // 前台/后台：窗口没有焦点时完全不跑常驻动效（后台挂着 = 零重绘）。
             // 输入空闲降档：连续 AmbientIdleAfterSeconds 秒没有任何鼠标/键盘操作，
             // 常驻档从 30fps 降到约 6fps；一旦有操作立即恢复。
+            //
+            // 计时进行中**同样**走快路径：秒数与进度环本来就每秒才变一次，而以前只要 running
+            // 就每帧 Invalidate，等于每秒白刷 19 次整窗（实测计时段要吃掉 1/3 个 CPU 核）。
+            // 现在计时中只有"秒变化"那一下才整窗重绘、顺手刷新缓存位图，其余帧全是廉价贴图。
+            // InteractionBurst 只负责把帧率拉到 60fps，不再强制整窗重绘——真正需要整窗重绘的
+            // 时刻（悬停/按压动画）都已经由 animating/uiDirty 覆盖，不必再靠爆发档兜底。
             bool ambientMedal = _ui.CanDrawMedalOnly && ContainsFocus && Visible;
-            _medalOnlyFrame = ambientMedal && _cacheValid && CacheMatches()
-                              && !animating && _ui.InteractionBurst <= 0
-                              && !running && !uiDirty && !secondChanged;
+            _medalOnlyFrame = ambientMedal && _cacheValid && CacheMatches() && !needFullRedraw;
+            if (needFullRedraw) _fullRedrawPending = true;
+
+            // 快路径本帧只需刷新"勋章 + 笔记光标"那一小块：算出它的设备像素矩形，
+            // 用 Invalidate(rect) 让系统只重画这一块——全窗贴图实测 3.9ms，其中绝大多数
+            // 是白刷的像素；按面积裁掉之后快路径的单帧成本几乎归零。
+            _fastRect = Rectangle.Empty;
+            if (_medalOnlyFrame)
+            {
+                var ar = _ui.AmbientDirtyRect;
+                if (ar.Width > 0.5f && ar.Height > 0.5f)
+                {
+                    int x0 = (int)Math.Floor(ar.Left * _scale) - 2;
+                    int y0 = (int)Math.Floor(ar.Top * _scale) - 2;
+                    int x1 = (int)Math.Ceiling(ar.Right * _scale) + 2;
+                    int y1 = (int)Math.Ceiling(ar.Bottom * _scale) + 2;
+                    if (x0 < 0) x0 = 0;
+                    if (y0 < 0) y0 = 0;
+                    if (x1 > ClientSize.Width) x1 = ClientSize.Width;
+                    if (y1 > ClientSize.Height) y1 = ClientSize.Height;
+                    if (x1 > x0 && y1 > y0) _fastRect = new Rectangle(x0, y0, x1 - x0, y1 - y0);
+                }
+            }
             double idleSeconds = now - _lastInputTime;
             int ambientMs = FrameTiming.AmbientMs(idleSeconds);
 
@@ -270,11 +330,14 @@ namespace TomatoFocus.App
             _frameInterval = target;
             if (probe != null) probe.NoteTarget(target);
 
-            // 动画结束的那一帧必须再重绘一次，否则最后一帧（含未清除的粒子/特效）会残留在屏幕上
-            if ((animating || running || secondChanged || _wasAnimating || uiDirty || ambientMedal) && Visible)
+            // 动画结束的那一帧必须再重绘一次，否则最后一帧（含未清除的粒子/特效）会残留在屏幕上。
+            // 条件里刻意**不含 running**：计时中只有"秒变化"或内容真的变了才整窗重绘；
+            // 若没装备勋章，这一秒内根本不需要重绘——计时期间的重绘次数因此从 20 次/秒降到 1 次/秒。
+            if ((needFullRedraw || ambientMedal) && Visible)
             {
                 _lastPaintSecond = sec;
-                Invalidate();
+                if (!needFullRedraw && !_fastRect.IsEmpty) Invalidate(_fastRect);   // 只刷勋章/光标
+                else Invalidate();                                                  // 整窗
             }
             _wasAnimating = animating;
         }
@@ -284,6 +347,13 @@ namespace TomatoFocus.App
         private Graphics _frameCacheG;
         private bool _cacheValid;
         private bool _medalOnlyFrame;
+        /// <summary>本帧有"必须整窗重绘"的理由（动画/脏/秒变化）。由 OnLoop 置位、DrawFrame 消费，
+        /// 这样即使 WM_PAINT 被推迟到下一轮循环之后，也不会误走快路径贴出过期画面。</summary>
+        private bool _fullRedrawPending;
+        /// <summary>本次 WM_PAINT 的无效区（客户区设备像素）。</summary>
+        private Rectangle _paintClip;
+        /// <summary>快路径本帧只需刷新的区域（设备像素）；空表示必须整窗刷新。</summary>
+        private Rectangle _fastRect = Rectangle.Empty;
         private int _fastPathFrames;
         private int _fullFrames;
         private double _lastAmbientLog;
@@ -335,9 +405,36 @@ namespace TomatoFocus.App
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
+
+            // 句柄重建（切 ShowInTaskbar、改某些窗口样式时 WinForms 会重建窗口）会让
+            // **已投递但还没派发**的 WM_FRAME 随旧窗口一起被系统丢弃；而背压标记只在
+            // WndProc 收到消息时才复位——于是它永远停在 1，渲染泵再也不投递任何一帧，
+            // 表现为整个程序卡死（连计时器的倒计时都停）。
+            // 所以句柄一重建就立刻复位背压标记，并强制下一帧整窗重绘（新窗口表面是空的）。
+            Interlocked.Exchange(ref _framePending, 0);
+            _fullRedrawPending = true;
+            _cacheValid = false;
+            if (_pumpStalls > 0) Log.Info("handle created（背压已复位，泵累计强制复位 " + _pumpStalls + " 次）");
+
             Native.RoundCorners(Handle);
             EnsureImeContext();
             StartPump();
+            try { Invalidate(); } catch (Exception) { }
+        }
+
+        /// <summary>窗口重新可见（极简/托盘唤出）时必须整窗重绘一次，否则可能贴出旧画面。</summary>
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            base.OnVisibleChanged(e);
+            if (Visible)
+            {
+                _fullRedrawPending = true;
+                _cacheValid = false;
+                // 抽屉若在隐藏期间已被逻辑关闭，直接落到关闭终态：
+                // 否则那段"收起补间"会在窗口恢复可见的瞬间才播出来（观感是卡一下再滑走）。
+                try { _ui.SettleDrawerForShow(); } catch (Exception) { }
+                try { Invalidate(); } catch (Exception) { }
+            }
         }
 
         /// <summary>
@@ -506,6 +603,7 @@ namespace TomatoFocus.App
             _ui.Bounds = new RectangleF(0, 0, ClientSize.Width / _scale, ClientSize.Height / _scale);
 
             var probe = PerfProbe.Active;
+            _paintClip = e.ClipRectangle;
             _paintClock.Restart();
             try { DrawFrame(e.Graphics); }
             catch (Exception ex) { Log.Error("OnPaint", ex); }
@@ -516,12 +614,17 @@ namespace TomatoFocus.App
 
         /// <summary>
         /// 画一帧。
-        /// 只有顶栏勋章在变时走快路径：贴上缓存位图 + 只重画那枚勋章（约 2ms，因此能跑 30fps）；
+        /// 只有勋章在变时走快路径：贴缓存位图 + 只重画那几枚勋章（因此能跑 30fps）；
         /// 其余情况整窗重绘，并把结果存进缓存供快路径当背景。
         /// </summary>
         private void DrawFrame(Graphics g)
         {
-            if (_medalOnlyFrame && _cacheValid && CacheMatches())
+            // 先消费"必须整窗重绘"标记：WM_PAINT 可能被推迟到下一轮 OnLoop 之后才派发，
+            // 那时 _medalOnlyFrame 会被重算为 true，若只信它就会贴出过期的一帧。
+            bool forceFull = _fullRedrawPending;
+            _fullRedrawPending = false;
+
+            if (!forceFull && _medalOnlyFrame && _cacheValid && CacheMatches() && NoBufferOffset(g))
             {
                 try
                 {
@@ -530,16 +633,18 @@ namespace TomatoFocus.App
                         Log.Info("medalFastPath: 已启用 窗口=" + Left + "," + Top + " " + Width + "x" + Height +
                                  " 缓存=" + (_frameCache != null ? _frameCache.Width + "x" + _frameCache.Height : "无"));
                     long ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                    // 贴图必须用 GDI+（DrawImageUnscaled），**不能用 BitBlt**：
+                    // 目标 Graphics 是 WinForms 的绘制缓冲/离屏位图，通过 GetHdc() 向它做 GDI 写入
+                    // 不会被保留（实测整帧变全黑，只剩 GDI+ 画的勋章），这条路径踩过一次坑。
                     var st = g.Save();
-                    try
-                    {
-                        g.ResetTransform();
-                        g.DrawImageUnscaled(_frameCache, 0, 0);
-                    }
+                    try { g.ResetTransform(); g.DrawImageUnscaled(_frameCache, 0, 0); }
                     finally { g.Restore(st); }
+                    PerfCounters.Add("帧-快路径贴图", ts);
 
+                    long ts2 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _ui.DrawAmbientOverlay(g);
                     if (_frameCacheG != null) _ui.DrawAmbientOverlay(_frameCacheG);   // 同步更新缓存
+                    PerfCounters.Add("帧-快路径勋章", ts2);
                     PerfCounters.Add("帧-勋章快路径", ts);
                     return;
                 }
@@ -555,7 +660,27 @@ namespace TomatoFocus.App
             _medalOnlyFrame = false;
             _fullFrames++;
             _ui.Draw(g);
-            UpdateFrameCache(g);
+            // 只有整窗都被重绘时才能把这一帧存进缓存：局部重绘时缓冲区其余部分还是旧内容，
+            // 存进去会把缓存污染成"拼接帧"，之后快路径就会贴出错位画面。
+            if (_paintClip.Width >= ClientSize.Width && _paintClip.Height >= ClientSize.Height)
+                UpdateFrameCache(g);
+            else
+                _cacheValid = false;    // 下一帧必须整窗重绘，重建缓存
+        }
+
+        /// <summary>
+        /// 双缓冲的缓冲区若被框架按无效区分配，其 Graphics 会带一个平移变换，
+        /// 那样贴图原点就不是 (0,0) 了。这里显式检查，一旦有位移立刻退回整窗重绘，
+        /// 绝不冒着贴错位置的风险（这个坑已经在 BitBlt 那次踩过一遍）。
+        /// </summary>
+        private static bool NoBufferOffset(Graphics g)
+        {
+            try
+            {
+                var m = g.Transform;
+                return Math.Abs(m.OffsetX) < 0.5f && Math.Abs(m.OffsetY) < 0.5f;
+            }
+            catch (Exception) { return false; }
         }
 
         /// <summary>性能自检的阶段切换：进入计时段时真的跑一轮计时，测 20fps 档。</summary>
@@ -573,6 +698,7 @@ namespace TomatoFocus.App
                 string frameInfo = "勋章快路径帧=" + _fastPathFrames + " 全窗帧=" + _fullFrames +
                                    " 当前帧档位=" + _frameInterval + "ms 空闲=" + idle.ToString("0.0") + "s" +
                                    " 动效勋章数=" + _ui.AmbientMedalCount +
+                                   " | 渲染循环帧数=" + _loopTicks + " 泵强制复位=" + _pumpStalls +
                                    " | 笔记聚焦期间收到字符=" + _noteChars +
                                    " 最后字符码点=" + (_lastCharCode < 0 ? "无" : "U+" + _lastCharCode.ToString("X4")) +
                                    " 输入法打开次数=" + _imeOpenCount +

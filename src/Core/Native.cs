@@ -33,6 +33,8 @@ namespace TomatoFocus.Core
         public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         // GDI 位块传送：把一帧的绘制结果存进缓存位图（勋章快路径要用它当背景）
+        // 注意：**只对普通 Bitmap 的 Graphics 使用**。向"绘制用 Graphics"（WinForms 缓冲、
+        // DrawToBitmap 的离屏位图）经 GetHdc() 做 GDI 写入不会被保留——踩过一次整帧变黑的坑。
         [DllImport("gdi32.dll")]
         public static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int w, int h,
                                          IntPtr hdcSrc, int xSrc, int ySrc, int rop);

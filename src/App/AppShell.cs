@@ -259,12 +259,18 @@ namespace TomatoFocus.App
         {
             if (_app.Data.Settings.MinimalMode)
             {
-                _form.Ui.CloseDrawer();      // 先收起抽屉，避免下次唤出窗口时抽屉还开着
+                // CloseDrawer 只是"发起关闭动画"，而窗口紧接着就隐藏了：隐藏期间帧间隔 250ms、
+                // 动画步进又被钳到 1/30 秒，收起动画要两秒以上才收敛——下次唤出窗口时会看到
+                // 抽屉补间播一下再滑走（"卡顿一下然后自动关闭"）。
+                // 这里紧接着落到关闭终态，保证唤出窗口就是主页面。
+                _form.Ui.CloseDrawer();
+                _form.Ui.SettleDrawerForShow();
                 _form.Hide();
                 _form.ShowInTaskbar = false;
             }
             else
             {
+                _form.Ui.SettleDrawerForShow();   // 保险：返回正常状态必定是主页面
                 ShowMainWindow();
             }
             _tray.Refresh(true);

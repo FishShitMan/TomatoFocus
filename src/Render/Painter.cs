@@ -97,10 +97,31 @@ namespace TomatoFocus.Render
             }
         }
 
+        // --- 文本测量缓存 ---------------------------------------------------
+        // MeasureString 每次都要求 GDI+ 重新排版；而界面里有相当一部分文本每帧都在量
+        // 同一串内容（标题、称号、笔记最后一行…）。按 (字体 + 文本) 备忘，命中即为一次查找。
+        private static readonly Dictionary<string, SizeF> MeasureCache = new Dictionary<string, SizeF>(StringComparer.Ordinal);
+        private static readonly object MeasureLock = new object();
+
         public SizeF Measure(string s, Font f)
         {
             if (string.IsNullOrEmpty(s)) return SizeF.Empty;
-            return _g.MeasureString(s, f, int.MaxValue, StringFormat.GenericTypographic);
+            string key = f.Name + "\u0001" + f.Size.ToString("0.##") + "\u0001" + (int)f.Style + "\u0001" + s;
+
+            lock (MeasureLock)
+            {
+                SizeF hit;
+                if (MeasureCache.TryGetValue(key, out hit)) return hit;
+            }
+
+            SizeF size = _g.MeasureString(s, f, int.MaxValue, StringFormat.GenericTypographic);
+
+            lock (MeasureLock)
+            {
+                if (MeasureCache.Count > 1024) MeasureCache.Clear();
+                MeasureCache[key] = size;
+            }
+            return size;
         }
 
         public float TextWidth(string s, Font f) { return Measure(s, f).Width; }
@@ -452,11 +473,68 @@ namespace TomatoFocus.Render
             _g.DrawPath(PenOf(c, width, false), path);
         }
 
-        /// <summary>按宽度贪心折行（中英混排按字符断行）。</summary>
+        // --- 折行缓存 -------------------------------------------------------
+        // WrapLines 是"每追加一个字符就 MeasureString 一次"的 O(n·len) 文本测量：上限 500 字的
+        // 笔记每帧要测约 500 次，而笔记内容在帧间是**不变**的——每次整窗重绘都重算一遍纯属浪费，
+        // 在弱 CPU 上这一项足以吃掉整个帧预算。
+        // 这里按 (字体 + 可用宽度) 分桶、桶内按文本缓存折行结果；命中时只剩一次字典查找。
+        // 算法本身一字未改，因此折行结果与改动前逐字节一致。
+        private sealed class WrapBucket
+        {
+            public readonly Dictionary<string, List<string>> Lines =
+                new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        }
+
+        private static readonly Dictionary<string, WrapBucket> WrapCache =
+            new Dictionary<string, WrapBucket>(StringComparer.Ordinal);
+        private static readonly object WrapLock = new object();
+        private static int _wrapEntries;
+        private const int WrapBucketMax = 128;    // 单个宽度桶内的文本条数上限
+
+        /// <summary>按宽度贪心折行（中英混排按字符断行）。结果按 (字体, 宽度, 文本) 缓存。</summary>
         public List<string> WrapLines(string s, Font f, float maxWidth)
         {
+            if (string.IsNullOrEmpty(s) || maxWidth <= 4f) return new List<string>();
+
+            // 桶键必须用**精确**宽度（round-trip 格式）：
+            // 曾经把宽度量化到 0.5 DIP 以减少桶数量，结果可用宽度相差不到 1px 的两处
+            // 会共用同一个折行结果，断点差一个字符——提醒卡文案的换行位置就变了。
+            string bucketKey = f.Name + "\u0001" + f.Size.ToString("0.##") + "\u0001" + (int)f.Style +
+                               "\u0001" + maxWidth.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+
+            WrapBucket bucket;
+            lock (WrapLock)
+            {
+                if (!WrapCache.TryGetValue(bucketKey, out bucket))
+                {
+                    bucket = new WrapBucket();
+                    // 桶本身也要有界：窗口尺寸连续变化时宽度会一直变
+                    if (WrapCache.Count > 256) { WrapCache.Clear(); _wrapEntries = 0; }
+                    WrapCache[bucketKey] = bucket;
+                }
+                List<string> hit;
+                if (bucket.Lines.TryGetValue(s, out hit)) return hit;
+            }
+
+            // 在锁外做真正的测量：GDI+ 调用不占用锁
+            var lines = WrapLinesCore(s, f, maxWidth);
+
+            lock (WrapLock)
+            {
+                List<string> again;
+                if (bucket.Lines.TryGetValue(s, out again)) return again;
+                if (bucket.Lines.Count >= WrapBucketMax) { _wrapEntries -= bucket.Lines.Count; bucket.Lines.Clear(); }
+                bucket.Lines[s] = lines;
+                _wrapEntries++;
+                if (_wrapEntries > 512) { WrapCache.Clear(); _wrapEntries = 0; }   // 安全网
+            }
+            return lines;
+        }
+
+        /// <summary>真正的贪心折行（逐字符测量）。只应由 WrapLines 调用。</summary>
+        private List<string> WrapLinesCore(string s, Font f, float maxWidth)
+        {
             var lines = new List<string>();
-            if (string.IsNullOrEmpty(s) || maxWidth <= 4f) return lines;
             var line = new System.Text.StringBuilder();
             foreach (char ch in s)
             {

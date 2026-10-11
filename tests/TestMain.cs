@@ -1273,7 +1273,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.5.0");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.5.1");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()

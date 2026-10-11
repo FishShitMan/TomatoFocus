@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using TomatoFocus.Core;
 
 namespace TomatoFocus.Render.Art
@@ -138,17 +140,161 @@ namespace TomatoFocus.Render.Art
                     leaf, Theme.Shade(leaf, -0.22f));
         }
 
-        /// <summary>按格数绘制一颗番茄（0..10 格）。</summary>
+        // --- 番茄精灵缓存 ---------------------------------------------------
+        // 单颗番茄的即时绘制要付出：200 点超椭圆（每点 Cos/Sin + 2×Pow + 2×Sign）→ AddClosedCurve
+        // → PathGradientBrush 球体渐变 → SetClip(路径) 建 Region → 五瓣萼片（每瓣一套
+        // GraphicsPath + Matrix + 旋转平移）≈ 9 个 GDI+ 对象、数百次超越函数。
+        // 而日历里**每一个有记录的日子都要画一颗**，一个月 20~30 颗/整窗帧，且这些番茄在帧间
+        // 完全静止——这是"整窗重绘约 10ms"里最容易被忽略的一大块，弱 CPU 上会被放大数倍。
+        // 这里照 Painter.Shadow 的既有做法：渲染成设备分辨率位图后 1:1 贴图，命中即近乎零成本。
+        private sealed class SpriteKey
+        {
+            public string Id;
+            public int W, H;
+            public float Scale;
+            public int BlitX, BlitY;      // 贴图位置（设备像素）
+            public float FracX, FracY;    // 亚像素余量，烘进精灵内部
+            public bool Ok;
+        }
+
+        private static readonly Dictionary<string, Bitmap> SpriteCache = new Dictionary<string, Bitmap>(StringComparer.Ordinal);
+        private static readonly object SpriteLock = new object();
+        private const int SpriteCacheMax = 512;
+
+        /// <summary>精灵四周留出的设备像素余量，容纳抗锯齿外溢。</summary>
+        private const int SpriteMargin = 3;
+
+        private static SpriteKey MakeSpriteKey(Painter pt, RectangleF r, string kind, int tenths,
+                                               Color a, Color b, Color c)
+        {
+            var k = new SpriteKey();
+            float scale = pt.Scale <= 0f ? 1f : pt.Scale;
+
+            // 关键：**把亚像素余量烘进精灵**，而不是简单四舍五入贴图位置。
+            // 设备坐标 = floor(r.Left*scale) + frac，精灵内部按 (SpriteMargin+frac) 绘制、
+            // 再贴到 (floor - SpriteMargin)，于是落点恰好等于 r.Left*scale ——
+            // 与改动前的即时绘制**逐像素一致**，不会出现最多半个像素的整体偏移。
+            int bx = (int)Math.Floor(r.Left * scale);
+            int by = (int)Math.Floor(r.Top * scale);
+            float fx = r.Left * scale - bx;
+            float fy = r.Top * scale - by;
+
+            int pw = (int)Math.Ceiling(r.Width * scale + fx) + SpriteMargin + 1;
+            int ph = (int)Math.Ceiling(r.Height * scale + fy) + SpriteMargin + 1;
+            if (r.Width <= 1f || r.Height <= 1f || pw < 6 || ph < 6 || pw > 512 || ph > 512) return k;
+
+            k.Ok = true;
+            k.W = pw;
+            k.H = ph;
+            k.Scale = scale;
+            k.BlitX = bx - SpriteMargin;
+            k.BlitY = by - SpriteMargin;
+            k.FracX = fx;
+            k.FracY = fy;
+            // 余量按 1/1024 像素量化进 key：同名精灵的渲染位置最多差 1/1024 px，
+            // 肉眼与逐像素比对都不可能分辨，但能让缓存键收敛。
+            k.Id = kind + "|" + pw + "|" + ph + "|" + tenths + "|" +
+                   ((int)Math.Round(fx * 1024f)) + "|" + ((int)Math.Round(fy * 1024f)) + "|" +
+                   a.ToArgb() + "|" + b.ToArgb() + "|" + c.ToArgb() + "|" + pt.T.Bg.ToArgb() + "|" +
+                   scale.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+            return k;
+        }
+
+        private static Bitmap SpriteGet(SpriteKey k)
+        {
+            lock (SpriteLock)
+            {
+                Bitmap hit;
+                return SpriteCache.TryGetValue(k.Id, out hit) ? hit : null;
+            }
+        }
+
+        /// <summary>渲染精灵。只在缓存未命中时调用，因此这里的委托分配不影响稳态帧。</summary>
+        private static Bitmap SpriteBuild(SpriteKey k, Painter pt, RectangleF r, Action<Painter, RectangleF> body)
+        {
+            Bitmap bmp = null;
+            try
+            {
+                bmp = new Bitmap(k.W, k.H, PixelFormat.Format32bppPArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Transparent);
+                    var inner = new Painter(g, k.Scale, pt.T);
+                    body(inner, new RectangleF((SpriteMargin + k.FracX) / k.Scale,
+                                               (SpriteMargin + k.FracY) / k.Scale,
+                                               r.Width, r.Height));
+                }
+            }
+            catch (Exception)
+            {
+                if (bmp != null) bmp.Dispose();
+                return null;
+            }
+
+            lock (SpriteLock)
+            {
+                Bitmap hit;
+                if (SpriteCache.TryGetValue(k.Id, out hit)) { bmp.Dispose(); return hit; }
+                if (SpriteCache.Count >= SpriteCacheMax)
+                {
+                    foreach (var v in SpriteCache.Values) { try { v.Dispose(); } catch { } }
+                    SpriteCache.Clear();
+                }
+                SpriteCache[k.Id] = bmp;
+                return bmp;
+            }
+        }
+
+        /// <summary>
+        /// 把精灵 1:1 贴回界面。**必须临时重置世界变换**：带着 1.5 倍缩放去 DrawImage，
+        /// GDI+ 会走 InterpolationMode 重采样管线，比即时绘制还慢（见 Painter.Shadow 的同一处教训）。
+        /// </summary>
+        private static void BlitSprite(Painter pt, SpriteKey k, Bitmap bmp)
+        {
+            var st = pt.Raw.Save();
+            try
+            {
+                pt.Raw.ResetTransform();
+                pt.Raw.DrawImageUnscaled(bmp, k.BlitX, k.BlitY);
+            }
+            finally { pt.Raw.Restore(st); }
+        }
+
+        /// <summary>按格数绘制一颗番茄（0..10 格）。走精灵缓存。</summary>
         public static void DrawTenths(Painter pt, RectangleF r, int tenthsInTomato, bool aborted)
         {
+            if (r.Width <= 1f || r.Height <= 1f) return;
             float fill = tenthsInTomato / 10f;
             Color body = aborted ? Theme.Blend(pt.T.Accent, pt.T.Warn, 0.55f) : pt.T.Accent;
             Color dark = aborted ? Theme.Shade(pt.T.Warn, -0.25f) : pt.T.AccentDark;
-            DrawTomato(pt, r, fill, true, body, dark, pt.T.Leaf);
+            Color leaf = pt.T.Leaf;
+
+            var k = MakeSpriteKey(pt, r, "tenths", tenthsInTomato, body, dark, leaf);
+            if (k.Ok)
+            {
+                var bmp = SpriteGet(k) ?? SpriteBuild(k, pt, r,
+                    delegate(Painter inner, RectangleF target) { DrawTomato(inner, target, fill, true, body, dark, leaf); });
+                if (bmp != null) { BlitSprite(pt, k, bmp); return; }
+            }
+            DrawTomato(pt, r, fill, true, body, dark, leaf);     // 回退：尺寸异常或缓存失败
         }
 
         /// <summary>单色剪影版（用于深色底上的反色显示）：未获得部分为淡墨，已获得部分为纯墨。</summary>
         public static void DrawTenthsMono(Painter pt, RectangleF r, int tenthsInTomato, Color ink)
+        {
+            if (r.Width <= 1f || r.Height <= 1f) return;
+            var k = MakeSpriteKey(pt, r, "mono", tenthsInTomato, ink, ink, ink);
+            if (k.Ok)
+            {
+                var bmp = SpriteGet(k) ?? SpriteBuild(k, pt, r,
+                    delegate(Painter inner, RectangleF target) { DrawTenthsMonoCore(inner, target, tenthsInTomato, ink); });
+                if (bmp != null) { BlitSprite(pt, k, bmp); return; }
+            }
+            DrawTenthsMonoCore(pt, r, tenthsInTomato, ink);
+        }
+
+        /// <summary>单色剪影的即时绘制实现。</summary>
+        private static void DrawTenthsMonoCore(Painter pt, RectangleF r, int tenthsInTomato, Color ink)
         {
             float fill = tenthsInTomato / 10f;
             if (fill < 0f) fill = 0f;
@@ -200,7 +346,17 @@ namespace TomatoFocus.Render.Art
                 return;
             }
             Color body = tint ?? pt.T.Accent;
-            DrawTomato(pt, r, 1f, true, body, Theme.Shade(body, -0.28f), pt.T.Leaf);
+            Color dark = Theme.Shade(body, -0.28f);
+            Color leaf = pt.T.Leaf;
+
+            var k = MakeSpriteKey(pt, r, "icon", 10, body, dark, leaf);
+            if (k.Ok)
+            {
+                var bmp = SpriteGet(k) ?? SpriteBuild(k, pt, r,
+                    delegate(Painter inner, RectangleF target) { DrawTomato(inner, target, 1f, true, body, dark, leaf); });
+                if (bmp != null) { BlitSprite(pt, k, bmp); return; }
+            }
+            DrawTomato(pt, r, 1f, true, body, dark, leaf);
         }
 
         /// <summary>按比例居中绘制外部图片。</summary>

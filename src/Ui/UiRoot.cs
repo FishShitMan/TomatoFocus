@@ -174,6 +174,23 @@ namespace TomatoFocus.Ui
             _ambientCaret = rect;
             _ambientCaretBg = bg;
             _ambientCaretInk = ink;
+            GrowAmbientRect(rect);
+        }
+
+        // --- 环境动效的影响区域（用于局部无效区重绘）------------------------
+        // 快路径每帧只需要重画"勋章 + 笔记光标"这一小块。把这些矩形并起来交给外壳，
+        // 就能用 Invalidate(rect) 让系统只刷新这一小块——全窗贴图 3.9ms 里绝大部分是
+        // 白刷的像素，按面积裁掉后单帧成本几乎归零，这是低配设备上最值钱的一项。
+        private RectangleF _ambientRect = RectangleF.Empty;
+
+        /// <summary>本帧环境动效（勋章/光标）影响到的区域（DIP，已含抗锯齿余量）。</summary>
+        public RectangleF AmbientDirtyRect { get { return _ambientRect; } }
+
+        private void GrowAmbientRect(RectangleF r)
+        {
+            if (r.Width <= 0f || r.Height <= 0f) return;
+            var g = RectangleF.Inflate(r, 2f, 2f);   // 抗锯齿外溢余量
+            _ambientRect = _ambientRect.Width <= 0f ? g : RectangleF.Union(_ambientRect, g);
         }
 
         /// <summary>本帧登记到的光标矩形（供测试观察）。</summary>
@@ -207,6 +224,7 @@ namespace TomatoFocus.Ui
             m.Locked = false;
             m.Clip = clip;
             _ambientMedals.Add(m);
+            GrowAmbientRect(rect);
         }
 
         /// <summary>本帧登记到的动效勋章数量（供测试观察）。</summary>
@@ -748,8 +766,11 @@ namespace TomatoFocus.Ui
             _ambientAnimation = false;      // 每帧由勋章绘制重新置位
             _ambientMedals.Clear();         // 每帧重新登记需要动效的勋章
             _ambientCaret = RectangleF.Empty;
+            _ambientRect = RectangleF.Empty;   // 每帧重新累计环境动效影响区域
             var t = _app.CurrentTheme;
             long ts0 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            // 清屏必须走 GDI+ 的 Graphics.Clear。曾试过用 GDI PatBlt 经 GetHdc 快填，
+            // 实测向"绘制用 Graphics"做 GDI 写入不会被保留（与快路径贴图同一个坑），已撤销。
             g.Clear(t.Bg);
             PerfCounters.Add("清屏", ts0);
 
@@ -1095,6 +1116,24 @@ namespace TomatoFocus.Ui
 
         /// <summary>收起抽屉（例如切到极简模式前）。</summary>
         public void CloseDrawer() { BeginDrawerClose(); _clearStage = 0; _holdProgress = 0f; _scrollTarget = -1f; }
+
+        /// <summary>
+        /// 窗口重新可见时调用：抽屉若**逻辑上已经关闭**，就直接落到关闭终态、丢掉关闭快照。
+        /// 背景：收起抽屉是一段约 0.3 秒的补间，而窗口隐藏期间帧间隔是 250ms、动画步进又被
+        /// <see cref="FrameTiming.ClampAnimationDelta"/> 钳到 1/30 秒——一次收起要两秒以上才收敛。
+        /// 用户在这期间唤回窗口，就会看到抽屉"卡一下、再自己滑走"。
+        /// 反正隐藏期的中间帧没人看见，直接落到终态即可。
+        /// 抽屉若本来就开着（例如只是收进托盘又唤出），保持原样。
+        /// </summary>
+        public void SettleDrawerForShow()
+        {
+            if (!string.IsNullOrEmpty(_drawer)) return;
+            _closingDrawer = "";
+            _closingDayKey = "";
+            _closingScroll = 0f;
+            A("drawer", 0f, 13f).Jump(0f);
+            _dirty = true;
+        }
         public void SetViewMonth(DateTime month) { _viewMonth = new DateTime(month.Year, month.Month, 1); _dirty = true; }
         public void SetYearView(bool on) { _yearView = on; _dirty = true; }
         public string CurrentDrawer { get { return _drawer; } }
