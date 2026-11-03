@@ -33,6 +33,9 @@ namespace TomatoFocus.Core
         public Theme CurrentTheme = Theme.ById("fresh");
         public Reminder Pending;
 
+        /// <summary>任务编排器（与主计时联动：任务轮次直接跑在 TimerEngine 上）。</summary>
+        public TaskRunner Task;
+
         /// <summary>最近一次结算中解锁的成就数（不落盘，仅供外壳决定播哪个音效）。</summary>
         public int LastUnlockedCount;
 
@@ -57,8 +60,18 @@ namespace TomatoFocus.Core
 
         public AppState()
         {
+            Task = new TaskRunner(this);
             // 结算由状态层自己负责，外壳只关心 UI 反应（音效/动效/托盘气泡）
-            Timer.FocusCompleted += delegate (object s, FocusCompletedEventArgs e) { RecordSession(e); };
+            Timer.FocusCompleted += delegate (object s, FocusCompletedEventArgs e)
+            {
+                // 任务模式：不逐轮写记录，交给编排器推进；任务结束时才写**一条**
+                if (Task != null && Task.Active) { Task.OnFocusCompleted(e); return; }
+                RecordSession(e);
+            };
+            Timer.BreakCompleted += delegate
+            {
+                if (Task != null && Task.Active) Task.OnBreakCompleted();
+            };
         }
 
         public void Load()
@@ -72,6 +85,9 @@ namespace TomatoFocus.Core
                 !string.Equals(Data.Settings.LastPresetId, "custom", StringComparison.Ordinal))
                 Timer.SetPresetMinutes(Data.Settings.LastPresetMinutes,
                     string.IsNullOrEmpty(Data.Settings.LastPresetId) ? "25" : Data.Settings.LastPresetId);
+            // 上次退出时任务还在跑（程序自身崩溃/被杀）→ 转"异常中断"，由中断弹窗让用户决定
+            if (Data.CurrentTask != null && Data.CurrentTask.Status == TaskState.StatusRunning)
+                Data.CurrentTask.Status = TaskState.StatusInterrupted;
         }
 
         /// <summary>记住当前档位（仅固定档位；自定值按设计不跨会话保留）。</summary>
@@ -125,6 +141,7 @@ namespace TomatoFocus.Core
                 if (h != null) h(this, EventArgs.Empty);
             }
             CheckGreeting(DateTime.Now);
+            if (Task != null) Task.Update();      // 任务：秒节拍采样前台、推进轮次、宽限自动暂停
         }
 
         private int _lastClockSecond = -1;
@@ -297,6 +314,67 @@ namespace TomatoFocus.Core
             var rem = ReminderRequested;
             if (rem != null) rem(this, EventArgs.Empty);
             return rec;
+        }
+
+        /// <summary>
+        /// 任务结算：写入**一条**会话记录（普通与任务共走通用记录通道）。
+        /// 基础按实际专注秒数折算（放弃走半收益）；唯有"完成且未声明提前完成"才加 20% 额外奖励。
+        /// </summary>
+        public SessionRecord RecordTaskSession(TaskState st, int focusedSec, TaskMath.TaskOutcome outcome)
+        {
+            if (st == null) return null;
+            int tenths = TomatoMath.TenthsFor(focusedSec, TaskMath.IsAborted(outcome));
+            int bonus = TaskMath.HasBonus(outcome) ? TaskMath.BonusTenths(tenths) : 0;
+
+            var rec = new SessionRecord();
+            rec.Id = Guid.NewGuid().ToString("N");
+            rec.StartedAt = string.IsNullOrEmpty(st.StartedAt) ? DayKey.Stamp(DateTime.Now) : st.StartedAt;
+            rec.PlannedSec = st.TotalFocusSeconds;
+            rec.FocusedSec = focusedSec;
+            rec.Tenths = tenths;
+            rec.BonusTenths = bonus;
+            rec.Preset = "task";
+            rec.TaskProcess = st.ProcessName ?? "";
+            rec.TaskExe = st.WindowTitle ?? "";
+            rec.Aborted = TaskMath.IsAborted(outcome);
+            rec.Note = Data.Settings.NoteDraft ?? "";
+            Data.Sessions.Add(rec);
+            LastRecordedNote = rec.Note;
+            Data.Settings.NoteDraft = "";
+            Store.RebuildDays(Data);
+
+            _continuousFocusSeconds = 0;
+            var unlocked = Achievements.Evaluate(Data, DateTime.Now);
+            Save();
+            LastUnlockedCount = unlocked.Count;
+
+            var rh = SessionRecorded;
+            if (rh != null) rh(this, rec);
+            if (unlocked.Count > 0)
+            {
+                var ah = AchievementsUnlocked;
+                if (ah != null) ah(this, unlocked);
+            }
+            MarkDirty();
+
+            if (tenths <= 0)
+                ShowToast(I18n.T("task.settled.none", TomatoMath.FormatClock(focusedSec)));
+            else
+                ShowToast(I18n.T("task.settled", TomatoMath.Format(tenths), TomatoMath.Format(bonus)));
+            return rec;
+        }
+
+        /// <summary>任务模式：专注轮完成后的"选休息时长"卡片（复用提醒卡通道）。</summary>
+        public void ShowTaskBreakReminder()
+        {
+            var r = new Reminder();
+            r.BreakSeconds = Data.CurrentTask == null ? Data.Settings.BreakSeconds : Data.CurrentTask.BreakRoundSeconds;
+            r.TitleKey = "task.break.title";
+            r.ExtraKey = "task.break.body";
+            r.Phrase = HealthRules.NextPhrase(ref _lastPhraseIndex);
+            Pending = r;
+            var h = ReminderRequested;
+            if (h != null) h(this, EventArgs.Empty);
         }
 
         /// <summary>撤回上一条记录（误操作时用）。</summary>

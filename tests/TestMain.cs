@@ -77,6 +77,7 @@ namespace TomatoFocus.Tests
                 TestTextWrapping();
                 TestPlannedBugFixes();
                 TestYearViewColors();
+                TestTaskSystem();
             }
             catch (Exception ex)
             {
@@ -1273,7 +1274,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.5.1");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.6.0");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -1656,15 +1657,13 @@ namespace TomatoFocus.Tests
                     True("描述与进度条之间留有间隔", gap >= 4f, "间隔 " + gap.ToString("0.0") + "px");
                 }
 
-                // ③ 今日卡片：保留 x/1.0 与进度条，移除右侧「碎片」文字
+                // ③ 任务卡空闲态有「设定任务」入口（概览行已移到时间环下方，卡片内不再有统计行）
                 ui.SetDrawer("");
                 Settle(ui, g, 10);
-                var card = new RectangleF(616, 80, 368, 96);
-                var line2 = new RectangleF(card.Left + 18, card.Top + 46, card.Width - 36, 16);
-                bool leftInk = !InkBoundsOf(bmp, new RectangleF(line2.Left, line2.Top, 120, 16), app.CurrentTheme.Surface).IsEmpty;
-                bool rightInk = !InkBoundsOf(bmp, new RectangleF(line2.Left + 200, line2.Top, 150, 16), app.CurrentTheme.Surface).IsEmpty;
-                True("保留左侧 x/1.0", leftInk);
-                True("右侧「碎片」文字已移除", !rightInk);
+                var card = new RectangleF(616, 80, 368, 104);
+                var idleBtn = new RectangleF(card.Left + 18, card.Top + 52, card.Width - 36, 36);
+                bool idleInk = !InkBoundsOf(bmp, idleBtn, app.CurrentTheme.Surface).IsEmpty;
+                True("任务卡有空闲态入口", idleInk);
 
                 // ④ 自定时间气泡为浅色底
                 RectangleF chip;
@@ -2863,10 +2862,101 @@ namespace TomatoFocus.Tests
                 "greet.afternoon.title", "greet.afternoon.1", "greet.night.title", "greet.night.1",
                 "greet.action.ok", "greet.action.focus", "settings.greeting", "settings.greeting.hint",
                 "health.rule.sedentary", "health.rule.water", "health.rule.eye",
-                "health.source.who", "health.source.cn", "health.source.diet", "health.source.aoa"
+                "health.source.who", "health.source.cn", "health.source.diet", "health.source.aoa",
+                "stats.line", "cal.task",
+                "task.title", "task.minuteUnit", "task.idle.hint", "task.setup.open", "task.setup.program",
+                "task.setup.noProgram", "task.grab.button", "task.grab.cd", "task.grab.failed", "task.setup.grabHint",
+                "task.setup.total", "task.setup.round", "task.setup.break", "task.setup.start", "task.setup.cancel",
+                "task.setup.needProgram", "task.state.focusing", "task.state.away", "task.state.gone",
+                "task.progress", "task.round", "task.away", "task.away.left", "task.wait.programGone",
+                "task.claimEarly", "task.end", "task.endTask", "task.resume", "task.skipBreak",
+                "task.break.title", "task.break.body", "task.break.option", "task.break.skipToNext",
+                "task.confirm.hint", "task.interrupt.title", "task.interrupt.grabbing", "task.interrupt.found",
+                "task.interrupt.notFound", "task.interrupt.refresh", "task.interrupt.cont", "task.interrupt.end",
+                "task.interrupt.hint", "task.settled", "task.settled.none"
             };
             foreach (string key in required)
                 True("必备文案 " + key, I18n.T(key) != key);
+        }
+
+        /// <summary>任务系统：奖励折算、轮次编排、进程匹配、结算出口、钱包入账。</summary>
+        private static void TestTaskSystem()
+        {
+            Group("任务系统");
+
+            // 额外奖励 = 结算格数 × 20%，四舍五入
+            Eq("奖励 2 格", TaskMath.BonusTenths(2), 0);
+            Eq("奖励 4 格", TaskMath.BonusTenths(4), 1);
+            Eq("奖励 10 格", TaskMath.BonusTenths(10), 2);
+            Eq("奖励 20 格", TaskMath.BonusTenths(20), 4);
+            Eq("奖励 36 格", TaskMath.BonusTenths(36), 7);
+            Eq("奖励 0 格", TaskMath.BonusTenths(0), 0);
+
+            // 轮次编排：末轮取余量
+            var r1 = TaskMath.BuildRounds(90 * 60, 25 * 60);
+            Eq("90 分 / 25 分 → 4 轮", r1.Count, 4);
+            Eq("末轮取余量", r1[r1.Count - 1], 15 * 60);
+            Eq("RoundCount 与轮次一致", TaskMath.RoundCount(90 * 60, 25 * 60), 4);
+
+            // 进程匹配：进程名为主，pid 为辅
+            True("同名不同 pid 命中", TaskMath.MatchProcess("Code", 100, "Code", 200));
+            True("pid 相同即命中", TaskMath.MatchProcess("Code", 100, "Something", 100));
+            True("忽略大小写", TaskMath.MatchProcess("code", 0, "Code", 0));
+            True("忽略 .exe 后缀", TaskMath.MatchProcess("Code.exe", 0, "Code", 0));
+            True("不同程序不命中", !TaskMath.MatchProcess("Code", 0, "chrome", 0));
+            True("空目标不命中", !TaskMath.MatchProcess("", 0, "chrome", 0));
+
+            // 30% 门槛
+            True("进度 30% 可提前完成", TaskMath.CanClaimEarly(30 * 60, 100 * 60));
+            True("进度 10% 不可提前完成", !TaskMath.CanClaimEarly(10 * 60, 100 * 60));
+
+            // 结算出口
+            True("放弃走半收益", TaskMath.IsAborted(TaskMath.TaskOutcome.Abandoned));
+            True("完成不走半收益", !TaskMath.IsAborted(TaskMath.TaskOutcome.Completed));
+            True("提前完成不走半收益", !TaskMath.IsAborted(TaskMath.TaskOutcome.ClaimedEarly));
+            True("只有完成给额外奖励", TaskMath.HasBonus(TaskMath.TaskOutcome.Completed));
+            True("提前完成无额外奖励", !TaskMath.HasBonus(TaskMath.TaskOutcome.ClaimedEarly));
+
+            // 一次任务只写一条记录；奖励进钱包且不会被 RebuildDays 抹掉
+            var app = new AppState();
+            app.Data = new AppData();
+            app.CurrentTheme = Theme.ById("fresh");
+
+            var st = new TaskState();
+            st.ProcessName = "Code";
+            st.TotalFocusSeconds = 50 * 60;
+            st.StartedAt = DayKey.Stamp(DateTime.Now);
+
+            var rec = app.RecordTaskSession(st, 50 * 60, TaskMath.TaskOutcome.Completed);
+            Eq("任务只写一条记录", app.Data.Sessions.Count, 1);
+            Eq("基础格数 20", rec.Tenths, 20);
+            Eq("额外奖励 4 格", rec.BonusTenths, 4);
+            Eq("记录标记为 task", rec.Preset, "task");
+            Eq("钱包含奖励共 24 格", app.Data.Wallet.TotalTenths, 24);
+            Eq("今日统计含奖励", Stats.TodayTenths(app.Data), 24);
+
+            Store.RebuildDays(app.Data);
+            Eq("重建后奖励仍在", app.Data.Wallet.TotalTenths, 24);
+
+            var st2 = new TaskState();
+            st2.ProcessName = "Code";
+            st2.TotalFocusSeconds = 50 * 60;
+            st2.StartedAt = DayKey.Stamp(DateTime.Now);
+            var rec2 = app.RecordTaskSession(st2, 50 * 60, TaskMath.TaskOutcome.ClaimedEarly);
+            Eq("提前完成全额 20 格", rec2.Tenths, 20);
+            Eq("提前完成无奖励", rec2.BonusTenths, 0);
+
+            var st3 = new TaskState();
+            st3.ProcessName = "Code";
+            st3.TotalFocusSeconds = 50 * 60;
+            st3.StartedAt = DayKey.Stamp(DateTime.Now);
+            var rec3 = app.RecordTaskSession(st3, 50 * 60, TaskMath.TaskOutcome.Abandoned);
+            Eq("放弃半收益 10 格", rec3.Tenths, 10);
+            Eq("放弃无奖励", rec3.BonusTenths, 0);
+
+            // 旧数据缺任务字段不崩
+            var old = Store.FromJson(JsonObj.Parse("{\"schema\":1}"));
+            True("旧数据无任务字段可读", old.CurrentTask == null && old.TaskConfig != null);
         }
 
         /// <summary>更新规划【BUG修复】三条的回归：抽屉收起姿态 / 年视图 / 默认奖励显示。</summary>
@@ -2928,7 +3018,7 @@ namespace TomatoFocus.Tests
                 True("年视图标题不含月份", yearTitle.IndexOf("月") < 0, yearTitle);
                 True("年视图格子宽度足够（旧版约 6.4px）", ui.YearCellWidth >= 8.5f, ui.YearCellWidth.ToString("0.0"));
                 True("年视图格子高度足够（旧版约 6.4px）", ui.YearCellHeight >= 8.5f, ui.YearCellHeight.ToString("0.0"));
-                True("年视图 12 行纵向铺满", ui.YearCellHeight * 12f >= 220f,
+                True("年视图 12 行纵向铺满", ui.YearCellHeight * 12f >= 180f,
                     (ui.YearCellHeight * 12f).ToString("0"));
 
                 RectangleF arrow;

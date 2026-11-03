@@ -36,7 +36,10 @@ namespace TomatoFocus.Core
         public int PlannedSec;                  // 计划时长
         public int FocusedSec;                  // 实际专注秒数（不含暂停）
         public int Tenths;                      // 结算格数（中断已减半）
-        public string Preset = "25";            // 5 / 15 / 25 / custom
+        public int BonusTenths;                 // 任务额外奖励格数（仅任务记录，已计入 Tenths 之外）
+        public string Preset = "25";            // 5 / 15 / 25 / custom / task
+        public string TaskProcess = "";         // 任务记录：目标程序名（如 "code"）
+        public string TaskExe = "";             // 任务记录：目标程序完整路径（详情行取图标用）
         public bool Aborted;                    // 是否提前中断
         public string Note = "";                // 本次番茄钟内的笔记
 
@@ -55,13 +58,16 @@ namespace TomatoFocus.Core
     internal sealed class DayStat
     {
         public int Tenths;
+        public int BonusTenths;                 // 其中来自任务额外奖励的格数（详情行展示用）
         public int FocusedSec;
         public int Sessions;
         public int AbortedCount;
 
         public void Add(SessionRecord s)
         {
-            Tenths += s.Tenths;
+            // Tenths 存"合计"（基础 + 任务奖励），BonusTenths 单独留一份用于详情行展示
+            Tenths += s.Tenths + s.BonusTenths;
+            BonusTenths += s.BonusTenths;
             FocusedSec += s.FocusedSec;
             Sessions += 1;
             if (s.Aborted) AbortedCount += 1;
@@ -69,7 +75,8 @@ namespace TomatoFocus.Core
 
         public void Remove(SessionRecord s)
         {
-            Tenths -= s.Tenths;
+            Tenths -= s.Tenths + s.BonusTenths;
+            BonusTenths -= s.BonusTenths;
             FocusedSec -= s.FocusedSec;
             Sessions -= 1;
             if (s.Aborted) AbortedCount -= 1;
@@ -133,6 +140,53 @@ namespace TomatoFocus.Core
         public bool IsOwned(string id) { return Owned.Contains(id); }
     }
 
+    /// <summary>任务配置：为某个程序设定的总专注目标与轮次节奏。</summary>
+    internal sealed class TaskConfig
+    {
+        public string ProcessName = "";          // 主匹配键（如 "Code"）
+        public int Pid;                          // 抓取时快照，仅用于同名多实例消歧
+        public string WindowTitle = "";          // 仅用于界面展示
+        public int TotalFocusSeconds = 90 * 60;  // 总专注目标
+        public int FocusRoundSeconds = 25 * 60;  // 单轮专注
+        public int BreakRoundSeconds = 5 * 60;   // 单轮休息
+    }
+
+    /// <summary>任务运行态（持久化：既供卡片显示，也用于程序崩溃后的恢复）。</summary>
+    internal sealed class TaskState
+    {
+        public const string StatusRunning = "running";
+        public const string StatusAway = "away";               // 长时偏离，已自动暂停
+        public const string StatusProgramGone = "programGone"; // 目标程序不在运行，暂停等待
+        public const string StatusInterrupted = "interrupted"; // 异常中断，待用户决定（继续/结束）
+        public const string StatusDone = "done";
+
+        public string ProcessName = "";
+        public int Pid;
+        public string WindowTitle = "";
+        public int TotalFocusSeconds;
+        public int FocusRoundSeconds;
+        public int BreakRoundSeconds;
+
+        public int AccumulatedFocusSec;   // 只累计"目标程序在前台"的专注秒数
+        public int AwaySec;               // 累计偏离秒数
+        public int ContinuousAwaySec;     // 连续偏离秒数（宽限计时用）
+        public int RoundIndex;            // 当前轮次（1 起）
+        public int RoundsTotal;           // 轮次总数
+        public string Status = StatusRunning;
+        public string StartedAt = "";
+        public bool ClaimedEarly;         // 用户是否声明"已提前完成"
+
+        /// <summary>任务仍占据主界面（未结算）。</summary>
+        public bool IsActive
+        {
+            get
+            {
+                return Status == StatusRunning || Status == StatusAway ||
+                       Status == StatusProgramGone || Status == StatusInterrupted;
+            }
+        }
+    }
+
     /// <summary>全部持久化数据。</summary>
     internal sealed class AppData
     {
@@ -145,6 +199,12 @@ namespace TomatoFocus.Core
         public Dictionary<string, DayStat> Days = new Dictionary<string, DayStat>(StringComparer.Ordinal);
         public Dictionary<string, AchievementState> Achievements = new Dictionary<string, AchievementState>(StringComparer.Ordinal);
         public RewardState Rewards = new RewardState();
+
+        /// <summary>任务配置（记住上次选的程序与时长）。</summary>
+        public TaskConfig TaskConfig = new TaskConfig();
+
+        /// <summary>进行中 / 待恢复的任务；null 表示没有。</summary>
+        public TaskState CurrentTask;
 
         /// <summary>通用计数器（起身活动次数等），避免为每个新统计改 schema。</summary>
         public Dictionary<string, int> Counters = new Dictionary<string, int>(StringComparer.Ordinal);

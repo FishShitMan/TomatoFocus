@@ -135,36 +135,15 @@ namespace TomatoFocus.Ui
             }
         }
 
-        // --- 右侧：今日卡片 + 日历 -----------------------------------------
+        // --- 右侧：任务卡片 + 日历 -----------------------------------------
         private void DrawRightPanel(Painter pt)
         {
             var t = pt.T;
             var r = _rightRect;
 
-            // 今日卡片
-            var card = new RectangleF(r.Left, r.Top, r.Width, 96);
-            pt.Shadow(card, 16f, 7f, t.Shadow);
-            pt.FillRound(card, 16f, t.Surface);
-
-            int todayTenths = Stats.TodayTenths(_app.Data);
-            DayStat today = Stats.DayOf(_app.Data, DayKey.Today);
-            int focusMin = today == null ? 0 : today.FocusedSec / 60;
-            int frag = TomatoMath.Fragment(todayTenths);
-
-            // 第一行：今日 X（左） + 专注 X 分钟（右，同一基线）
-            var line1 = new RectangleF(card.Left + 18, card.Top + 12, card.Width - 36, 28);
-            pt.TextLeft(I18n.T("today.tomatoes", TomatoMath.Format(todayTenths)), pt.F(19f, true), t.Text, line1);
-            pt.TextRight(I18n.T("today.minutes", focusMin), pt.F(12f), t.TextMuted, line1);
-
-            // 第二行：碎片进度（与进度条分离，不再与上一行重叠）
-            var line2 = new RectangleF(card.Left + 18, card.Top + 46, card.Width - 36, 16);
-            pt.TextLeft(I18n.T("wallet.fragmentProgress", TomatoMath.FormatFragment(frag)), pt.F(10.5f), t.TextMuted, line2);
-
-            // 碎片进度条
-            var barBg = new RectangleF(card.Left + 18, card.Top + 68, card.Width - 36, 8);
-            pt.FillRound(barBg, 4f, t.SurfaceAlt);
-            if (frag > 0)
-                pt.FillRound(new RectangleF(barBg.Left, barBg.Top, barBg.Width * frag / 10f, barBg.Height), 4f, t.Warn);
+            // 任务卡（占据原「今日」卡片的位置；今日统计压缩为卡片底部一行）
+            var card = new RectangleF(r.Left, r.Top, r.Width, TaskCardHeight);
+            DrawTaskCard(pt, card);
 
             // 日历
             float notesH = 116f;
@@ -931,32 +910,94 @@ namespace TomatoFocus.Ui
             foreach (var rec in list)
             {
                 bool hasNote = !string.IsNullOrEmpty(rec.Note);
-                float h = hasNote ? 86f : 62f;
+                bool isTask = string.Equals(rec.Preset, "task", StringComparison.Ordinal);
+                // 任务行多留一条进度条的高度
+                float h = (hasNote ? 86f : 62f) + (isTask ? 20f : 0f);
                 var row = new RectangleF(body.Left, y, body.Width, h);
                 if (row.Bottom > body.Top && row.Top < body.Bottom)
                 {
                     pt.FillRound(row, 12f, rec.Aborted ? Theme.Alpha(t.Warn, 40) : t.SurfaceAlt);
+
+                    // 可视化番茄移到行首左侧（普通/任务一致）
+                    int inTomato = rec.Tenths >= 10 ? 10 : rec.Tenths;
+                    TomatoArt.DrawTenths(pt, new RectangleF(row.Left + 14, row.Top + 12, 34, 34), inTomato, rec.Aborted);
+
                     var dt = rec.StartedLocal;
                     pt.Text(dt.ToString("HH:mm"), pt.F(13f, true, Painter.MonoFamily), t.Text,
-                        new RectangleF(row.Left + 14, row.Top + 10, 60, 20));
-                    pt.Text(I18n.T("cal.preset", rec.PlannedSec / 60), pt.F(11f), t.TextMuted,
-                        new RectangleF(row.Left + 14, row.Top + 32, 120, 18));
+                        new RectangleF(row.Left + 58, row.Top + 10, 60, 20));
 
+                    // 任务行：程序名（有条件时带图标）
+                    if (isTask)
+                    {
+                        float nx = row.Left + 112;
+                        var icon = TaskIcon(rec.TaskExe);
+                        if (icon != null)
+                        {
+                            try { pt.Raw.DrawImage(icon, new RectangleF(nx, row.Top + 12, 14, 14)); } catch (Exception) { }
+                            nx += 18f;
+                        }
+                        string proc = string.IsNullOrEmpty(rec.TaskProcess) ? I18n.T("task.record.unknown") : rec.TaskProcess;
+                        pt.Text(proc, pt.F(11f, true), t.AccentDark,
+                            new RectangleF(nx, row.Top + 10, row.Right - nx - 90, 20));
+                    }
+
+                    // 标签分设：普通行「档位 N 分钟」、任务行「任务 N 分钟」
+                    string label = isTask
+                        ? I18n.T("cal.task", rec.PlannedSec / 60)
+                        : I18n.T("cal.preset", rec.PlannedSec / 60);
+                    pt.Text(label, pt.F(11f), t.TextMuted, new RectangleF(row.Left + 58, row.Top + 32, 108, 18));
                     pt.Text(I18n.T("cal.focused", TomatoMath.FormatClock(rec.FocusedSec)), pt.F(11f), t.TextMuted,
-                        new RectangleF(row.Left + 100, row.Top + 32, 140, 18));
+                        new RectangleF(row.Left + 160, row.Top + 32, 140, 18));
 
-                    // 番茄图形
-                    int inTomato = rec.Tenths >= 10 ? 10 : rec.Tenths;
-                    TomatoArt.DrawTenths(pt, new RectangleF(row.Right - 110, row.Top + 12, 34, 34), inTomato, rec.Aborted);
-                    pt.TextRight(TomatoMath.Format(rec.Tenths), pt.F(12f, true), rec.Aborted ? t.Warn : t.AccentDark,
-                        new RectangleF(row.Right - 70, row.Top, 60, h - 22));
-                    if (rec.Aborted)
+                    // 任务行：进度条（底色加深保证可见）+ 百分比 + 「中断」标注在百分比右侧
+                    if (isTask)
+                    {
+                        var bar = new RectangleF(row.Left + 58, row.Top + 52, row.Width - 160 - 92, 7);
+                        pt.FillRound(bar, 3.5f, Theme.Alpha(t.TextMuted, 60));
+                        float ratio = rec.PlannedSec > 0
+                            ? Math.Min(1f, rec.FocusedSec / (float)rec.PlannedSec) : 0f;
+                        if (ratio > 0.002f)
+                            pt.FillRound(new RectangleF(bar.Left, bar.Top, Math.Max(4f, bar.Width * ratio), 7),
+                                3.5f, rec.Aborted ? t.Warn : t.Accent);
+
+                        pt.Text(I18n.T("cal.percent", (int)Math.Round(ratio * 100)),
+                            pt.F(9.5f, true), t.TextMuted,
+                            new RectangleF(bar.Right + 8, bar.Top - 4, 42, 14));
+                        if (rec.Aborted)
+                            pt.Text(I18n.T("cal.aborted"), pt.F(9.5f), t.Warn,
+                                new RectangleF(bar.Right + 50, bar.Top - 4, 38, 14));
+                    }
+
+                    // 分数统一固定在行内右上角，不随行高/有无笔记漂移
+                    float scoreY = row.Top + 10;
+                    float rightEdge = row.Right - 16;
+                    if (rec.BonusTenths > 0)
+                    {
+                        var bf = pt.F(11f, true);
+                        string bonus = "+" + TomatoMath.Format(rec.BonusTenths);
+                        float bw = pt.TextWidth(bonus, bf);
+                        pt.Text(bonus, bf, t.Warn, new RectangleF(rightEdge - bw, scoreY + 3, bw + 4, 20));
+
+                        var lf = pt.F(12f, true);
+                        string baseTxt = TomatoMath.Format(rec.Tenths);
+                        float lw = pt.TextWidth(baseTxt, lf);
+                        pt.Text(baseTxt, lf, rec.Aborted ? t.Warn : t.AccentDark,
+                            new RectangleF(rightEdge - bw - 8 - lw, scoreY, lw + 4, 22));
+                    }
+                    else
+                    {
+                        pt.TextRight(TomatoMath.Format(rec.Tenths), pt.F(12f, true), rec.Aborted ? t.Warn : t.AccentDark,
+                            new RectangleF(rightEdge - 60, scoreY, 60, 22));
+                    }
+
+                    // 「中断」跟随分数下移，避免与分数行重叠（任务行的「中断」已移到进度条右侧）
+                    if (rec.Aborted && !isTask)
                         pt.TextRight(I18n.T("cal.aborted"), pt.F(10f), t.Warn,
-                            new RectangleF(row.Right - 70, row.Top + 34, 60, 16));
+                            new RectangleF(row.Right - 70, scoreY + 20, 60, 16));
 
                     if (hasNote)
                         pt.TextWrapped(rec.Note, pt.F(10f), t.TextMuted,
-                            new RectangleF(row.Left + 14, row.Bottom - 30, row.Width - 130, 26), 13f);
+                            new RectangleF(row.Left + 58, row.Bottom - 30, row.Width - 160, 26), 13f);
                 }
                 y += h + 8f;
             }
@@ -975,7 +1016,8 @@ namespace TomatoFocus.Ui
             var t = pt.T;
             var b = Bounds;
             float w = Math.Min(560f, b.Width - 80f);
-            float h = 176f;
+            bool taskBreak = _app.Task != null && _app.Task.Active;   // 任务模式：额外提供 5/10/15/20 四个时长
+            float h = taskBreak ? 214f : 176f;
             var card = new RectangleF(b.Width / 2f - w / 2f, b.Height - h - 28 - (1 - k) * 24, w, h);
 
             pt.Shadow(card, 20f, 12f, t.Shadow);
@@ -987,6 +1029,41 @@ namespace TomatoFocus.Ui
             pt.Text(r.Phrase, pt.F(14f), t.AccentDark, new RectangleF(card.Left + 68, card.Top + 48, card.Width - 90, 24));
             if (!string.IsNullOrEmpty(r.ExtraKey))
                 pt.Text(I18n.T(r.ExtraKey), pt.F(11f), t.TextMuted, new RectangleF(card.Left + 68, card.Top + 72, card.Width - 90, 34));
+
+            bool hasNote = !string.IsNullOrEmpty(_app.LastRecordedNote);
+            if (taskBreak)
+            {
+                // 四个休息时长按钮（仅任务模式）：点选后时间环转为休息倒计时，结束后自动进下一轮专注
+                int[] mins = { 5, 10, 15, 20 };
+                float rowY = card.Bottom - 100;
+                float cw = (card.Width - 44 - 8 * (mins.Length - 1)) / mins.Length;
+                for (int i = 0; i < mins.Length; i++)
+                {
+                    int m = mins[i];
+                    var chip = new RectangleF(card.Left + 22 + i * (cw + 8), rowY, cw, 38);
+                    pt.FillRound(chip, 19f, t.AccentSoft);
+                    pt.TextCenter(I18n.T("task.break.option", m), pt.F(12f, true), t.AccentDark, chip);
+                    string id = "remBreak" + i;
+                    Hot(id, chip, delegate { _app.Task.TakeBreak(m); _dirty = true; });
+                }
+
+                float by2 = card.Bottom - 52;
+                var skip2 = new RectangleF(card.Left + 22, by2, 88, 38);
+                pt.FillRound(skip2, 19f, t.SurfaceAlt);
+                pt.TextCenter(I18n.T("task.break.skipToNext"), pt.F(12f, true), t.TextMuted, skip2);
+                Hot("remSkip", skip2, delegate { _app.Task.SkipBreak(); _dirty = true; });
+
+                var keep2 = new RectangleF(skip2.Right + 10, by2, 106, 38);
+                pt.FillRound(keep2, 19f, Theme.Alpha(t.SurfaceAlt, hasNote ? 255 : 140));
+                pt.TextCenter(I18n.T("break.keepNote"), pt.F(12f, true),
+                    Theme.Alpha(t.TextMuted, hasNote ? 255 : 130), keep2);
+                Hot("remKeep", keep2, delegate
+                {
+                    ShowToast(I18n.T(_app.KeepLastNote() ? "break.keepNote.done" : "break.keepNote.none"));
+                    _app.DismissReminder();
+                });
+                return;
+            }
 
             float by = card.Bottom - 52;
             var take = new RectangleF(card.Left + 22, by, 190, 38);
@@ -1005,7 +1082,6 @@ namespace TomatoFocus.Ui
             Hot("remSkip", skip, delegate { _app.DismissReminder(); });
 
             // 第三颗按钮：把上一次结算保存的笔记恢复到草稿，便于在原内容上继续续写
-            bool hasNote = !string.IsNullOrEmpty(_app.LastRecordedNote);
             var keep = new RectangleF(skip.Right + 10, by, 106, 38);
             pt.FillRound(keep, 19f, Theme.Alpha(t.SurfaceAlt, hasNote ? 255 : 140));
             pt.TextCenter(I18n.T("break.keepNote"), pt.F(12f, true),
@@ -1089,6 +1165,43 @@ namespace TomatoFocus.Ui
                                 : I18n.T("focus.stop.estimate", TomatoMath.FormatClock(sec), TomatoMath.Format(tenths)),
                 pt.F(11f), t.TextMuted, new RectangleF(bar.Left + 16, bar.Top + 32, bar.Width - 220, 20));
 
+            var no = new RectangleF(bar.Right - 90, bar.Top + 14, 74, 38);
+            pt.FillRound(no, 19f, t.SurfaceAlt);
+            pt.TextCenter(I18n.T("focus.stop.no"), pt.F(12f, true), t.TextMuted, no);
+            Hot("cfNo", no, delegate { _confirmStop = false; A("confirm").Set(0f); });
+
+            // 任务模式：在确认条里额外提供「我已提前完成」（全额结算、无额外奖励）
+            bool taskMode = _app.Task != null && _app.Task.Active;
+            if (taskMode)
+            {
+                bool canEarly = _app.Task.CanClaimEarly;
+                pt.Text(I18n.T("task.confirm.hint"), pt.F(10f), t.TextMuted,
+                    new RectangleF(bar.Left + 16, bar.Top + 50, bar.Width - 320, 14));
+
+                var early = new RectangleF(no.Left - 10 - 118, bar.Top + 14, 118, 38);
+                pt.FillRound(early, 19f, canEarly ? t.AccentSoft : Theme.Alpha(t.SurfaceAlt, 170));
+                pt.TextCenter(I18n.T("task.claimEarly"), pt.F(11.5f, true),
+                    canEarly ? t.AccentDark : Theme.Alpha(t.TextMuted, 140), early);
+                if (canEarly)
+                    Hot("cfEarly", early, delegate
+                    {
+                        _confirmStop = false;
+                        A("confirm").Set(0f);
+                        _app.Task.ClaimEarly();
+                    });
+
+                var yesT = new RectangleF(early.Left - 10 - 96, bar.Top + 14, 96, 38);
+                pt.FillRound(yesT, 19f, t.Warn);
+                pt.TextCenter(I18n.T("task.endTask"), pt.F(11.5f, true), Color.White, yesT);
+                Hot("cfYes", yesT, delegate
+                {
+                    _confirmStop = false;
+                    A("confirm").Set(0f);
+                    _app.Task.Abandon();
+                });
+                return;
+            }
+
             var yes = new RectangleF(bar.Right - 186, bar.Top + 14, 90, 38);
             pt.FillRound(yes, 19f, t.Warn);
             pt.TextCenter(I18n.T("focus.stop.yes"), pt.F(12f, true), Color.White, yes);
@@ -1098,11 +1211,6 @@ namespace TomatoFocus.Ui
                 A("confirm").Set(0f);
                 _app.Timer.StopEarly();
             });
-
-            var no = new RectangleF(bar.Right - 90, bar.Top + 14, 74, 38);
-            pt.FillRound(no, 19f, t.SurfaceAlt);
-            pt.TextCenter(I18n.T("focus.stop.no"), pt.F(12f, true), t.TextMuted, no);
-            Hot("cfNo", no, delegate { _confirmStop = false; A("confirm").Set(0f); });
         }
 
         // --- 提示与粒子 ----------------------------------------------------

@@ -126,12 +126,46 @@ namespace TomatoFocus.Core
                 w.Name("plannedSec").Value(rec.PlannedSec);
                 w.Name("focusedSec").Value(rec.FocusedSec);
                 w.Name("tenths").Value(rec.Tenths);
+                w.Name("bonusTenths").Value(rec.BonusTenths);
                 w.Name("preset").Value(rec.Preset);
+                w.Name("taskProcess").Value(rec.TaskProcess ?? "");
+                w.Name("taskExe").Value(rec.TaskExe ?? "");
                 w.Name("aborted").Value(rec.Aborted);
                 w.Name("note").Value(rec.Note);
                 w.EndObject();
             }
             w.EndArray();
+
+            // 任务配置（记住上次选的程序与时长）
+            w.Name("taskConfig").BeginObject();
+            w.Name("process").Value(d.TaskConfig.ProcessName);
+            w.Name("pid").Value(d.TaskConfig.Pid);
+            w.Name("title").Value(d.TaskConfig.WindowTitle);
+            w.Name("totalSec").Value(d.TaskConfig.TotalFocusSeconds);
+            w.Name("roundSec").Value(d.TaskConfig.FocusRoundSeconds);
+            w.Name("breakSec").Value(d.TaskConfig.BreakRoundSeconds);
+            w.EndObject();
+
+            // 进行中 / 待恢复的任务（没有任务时写一个空对象，process 为空即表示无）
+            var q = d.CurrentTask;
+            w.Name("currentTask").BeginObject();
+            w.Name("process").Value(q == null ? "" : q.ProcessName);
+            if (q != null)
+            {
+                w.Name("pid").Value(q.Pid);
+                w.Name("title").Value(q.WindowTitle);
+                w.Name("totalSec").Value(q.TotalFocusSeconds);
+                w.Name("roundSec").Value(q.FocusRoundSeconds);
+                w.Name("breakSec").Value(q.BreakRoundSeconds);
+                w.Name("accum").Value(q.AccumulatedFocusSec);
+                w.Name("away").Value(q.AwaySec);
+                w.Name("round").Value(q.RoundIndex);
+                w.Name("rounds").Value(q.RoundsTotal);
+                w.Name("status").Value(q.Status);
+                w.Name("startedAt").Value(q.StartedAt);
+                w.Name("claimedEarly").Value(q.ClaimedEarly);
+            }
+            w.EndObject();
 
             w.Name("days").BeginObject();
             foreach (var kv in d.Days)
@@ -221,10 +255,44 @@ namespace TomatoFocus.Core
                 rec.PlannedSec = oo.Int("plannedSec");
                 rec.FocusedSec = oo.Int("focusedSec");
                 rec.Tenths = oo.Int("tenths");
+                rec.BonusTenths = oo.Int("bonusTenths");
                 rec.Preset = oo.Str("preset", "25");
+                rec.TaskProcess = oo.Str("taskProcess", "");
+                rec.TaskExe = oo.Str("taskExe", "");
                 rec.Aborted = oo.Bool("aborted");
                 rec.Note = oo.Str("note", "");
                 d.Sessions.Add(rec);
+            }
+
+            // 任务配置
+            var to = root.Obj("taskConfig");
+            d.TaskConfig.ProcessName = to.Str("process", "");
+            d.TaskConfig.Pid = to.Int("pid");
+            d.TaskConfig.WindowTitle = to.Str("title", "");
+            d.TaskConfig.TotalFocusSeconds = to.Int("totalSec", 90 * 60);
+            d.TaskConfig.FocusRoundSeconds = to.Int("roundSec", 25 * 60);
+            d.TaskConfig.BreakRoundSeconds = to.Int("breakSec", 5 * 60);
+
+            // 进行中 / 待恢复的任务（process 为空 = 没有）
+            var cto = root.Obj("currentTask");
+            string proc = cto.Str("process", "");
+            if (!string.IsNullOrEmpty(proc))
+            {
+                var st = new TaskState();
+                st.ProcessName = proc;
+                st.Pid = cto.Int("pid");
+                st.WindowTitle = cto.Str("title", "");
+                st.TotalFocusSeconds = cto.Int("totalSec");
+                st.FocusRoundSeconds = cto.Int("roundSec");
+                st.BreakRoundSeconds = cto.Int("breakSec");
+                st.AccumulatedFocusSec = cto.Int("accum");
+                st.AwaySec = cto.Int("away");
+                st.RoundIndex = cto.Int("round");
+                st.RoundsTotal = cto.Int("rounds");
+                st.Status = cto.Str("status", TaskState.StatusInterrupted);
+                st.StartedAt = cto.Str("startedAt", "");
+                st.ClaimedEarly = cto.Bool("claimedEarly");
+                d.CurrentTask = st;
             }
 
             var daysObj = root.Obj("days");
@@ -306,6 +374,41 @@ namespace TomatoFocus.Core
             if (string.IsNullOrEmpty(d.Rewards.EquippedSound)) d.Rewards.EquippedSound = "sn_default";
             if (d.Wallet.SpentWhole < 0) d.Wallet.SpentWhole = 0;
             if (d.Wallet.TotalTenths < 0) d.Wallet.TotalTenths = 0;
+
+            // 任务配置值域夹紧
+            var tc = d.TaskConfig;
+            if (tc.TotalFocusSeconds < 5 * 60) tc.TotalFocusSeconds = 90 * 60;
+            if (tc.TotalFocusSeconds > 8 * 3600) tc.TotalFocusSeconds = 8 * 3600;
+            if (tc.FocusRoundSeconds < 5 * 60) tc.FocusRoundSeconds = 25 * 60;
+            if (tc.FocusRoundSeconds > 120 * 60) tc.FocusRoundSeconds = 120 * 60;
+            if (tc.BreakRoundSeconds < 60) tc.BreakRoundSeconds = 5 * 60;
+            if (tc.BreakRoundSeconds > 60 * 60) tc.BreakRoundSeconds = 60 * 60;
+            if (tc.Pid < 0) tc.Pid = 0;
+
+            // 任务运行态：值域夹紧 + 非法状态归为"异常中断"
+            var ct = d.CurrentTask;
+            if (ct != null)
+            {
+                if (string.IsNullOrEmpty(ct.ProcessName)) d.CurrentTask = null;
+                else
+                {
+                    if (ct.TotalFocusSeconds < 60) ct.TotalFocusSeconds = 60;
+                    if (ct.TotalFocusSeconds > 8 * 3600) ct.TotalFocusSeconds = 8 * 3600;
+                    if (ct.FocusRoundSeconds < 60) ct.FocusRoundSeconds = 60;
+                    if (ct.BreakRoundSeconds < 30) ct.BreakRoundSeconds = 30;
+                    if (ct.AccumulatedFocusSec < 0) ct.AccumulatedFocusSec = 0;
+                    if (ct.AwaySec < 0) ct.AwaySec = 0;
+                    if (ct.ContinuousAwaySec < 0) ct.ContinuousAwaySec = 0;
+                    if (ct.RoundIndex < 1) ct.RoundIndex = 1;
+                    if (ct.RoundsTotal < 1) ct.RoundsTotal = 1;
+                    if (ct.Pid < 0) ct.Pid = 0;
+                    string st2 = ct.Status;
+                    if (st2 != TaskState.StatusRunning && st2 != TaskState.StatusAway &&
+                        st2 != TaskState.StatusProgramGone && st2 != TaskState.StatusInterrupted)
+                        ct.Status = TaskState.StatusInterrupted;
+                }
+            }
+
             RebuildDays(d);
         }
 
@@ -321,7 +424,7 @@ namespace TomatoFocus.Core
                 DayStat st;
                 if (!d.Days.TryGetValue(key, out st)) { st = new DayStat(); d.Days[key] = st; }
                 st.Add(rec);
-                total += rec.Tenths;
+                total += rec.Tenths + rec.BonusTenths;   // 任务额外奖励也计入钱包（第四节「均计入」）
             }
             d.Wallet.TotalTenths = total;
             if (d.Wallet.SpentWhole > TomatoMath.Whole(total)) d.Wallet.SpentWhole = TomatoMath.Whole(total);

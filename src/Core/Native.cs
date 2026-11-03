@@ -254,6 +254,74 @@ namespace TomatoFocus.Core
             catch { }
         }
 
+        // --- 前台进程（任务系统的目标程序检测）------------------------------
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+        /// <summary>前台窗口所属进程。</summary>
+        public sealed class ForegroundInfo
+        {
+            public int Pid;
+            public string ProcessName = "";   // 不含 .exe
+            public string WindowTitle = "";
+        }
+
+        /// <summary>
+        /// 取当前前台窗口所属进程。系统进程、已退出、权限不足时返回 null。
+        /// 已知限制：全屏独占程序与 UAC 提权窗口可能取不到 pid，会被判为"偏离"。
+        /// </summary>
+        public static ForegroundInfo ForegroundProcess()
+        {
+            try
+            {
+                IntPtr h = GetForegroundWindow();
+                if (h == IntPtr.Zero) return null;
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (pid == 0) return null;
+                string name, title;
+                try
+                {
+                    using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+                    {
+                        name = p.ProcessName ?? "";
+                        try { title = p.MainWindowTitle ?? ""; } catch (Exception) { title = ""; }
+                    }
+                }
+                catch (Exception) { return null; }
+                var info = new ForegroundInfo();
+                info.Pid = (int)pid;
+                info.ProcessName = name;
+                info.WindowTitle = title;
+                return info;
+            }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>同名进程是否还在运行（任务中断后判断目标程序是否回来了）。</summary>
+        public static bool ProcessAlive(string name)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(name)) return false;
+                var all = System.Diagnostics.Process.GetProcessesByName(name);
+                bool alive = all != null && all.Length > 0;
+                if (all != null) foreach (var p in all) { try { p.Dispose(); } catch (Exception) { } }
+                return alive;
+            }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>本进程 pid（抓取前台程序时用来排除自己）。</summary>
+        public static int SelfPid()
+        {
+            try { return System.Diagnostics.Process.GetCurrentProcess().Id; }
+            catch (Exception) { return 0; }
+        }
+
         /// <summary>唤醒已在运行的实例。</summary>
         public static bool WakeExisting()
         {

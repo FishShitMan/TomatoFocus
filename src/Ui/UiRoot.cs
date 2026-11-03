@@ -801,6 +801,7 @@ namespace TomatoFocus.Ui
             DrawGreetingCard(pt);
             DrawDrawer(pt);      // 抽屉永远在最上层，避免层级与热区错乱
             DrawToast(pt);
+            DrawTaskInterrupted(pt);   // 任务异常中断弹窗（最上层模态卡）
             DrawDebugPanel(pt);
             PerfCounters.Add("其它层", ts);
         }
@@ -1554,13 +1555,15 @@ namespace TomatoFocus.Ui
         }
 
         /// <summary>底部概览：本周 / 连续天数 / 累计，与右侧“今日”卡片不重复。</summary>
+        /// <summary>时间环下方的一行概览：连续天数 · 今日颗数 · 今日专注分钟。</summary>
         private void DrawSummaryLine(Painter pt, RectangleF r)
         {
             var t = pt.T;
-            int weekTenths = Stats.WeekTenths(_app.Data, DateTime.Now);
             int streak = Stats.Streak(_app.Data, DateTime.Now);
-            int totalWhole = TomatoMath.Whole(_app.Data.Wallet.TotalTenths);
-            string text = I18n.T("week.summary", TomatoMath.Format(weekTenths), streak, totalWhole);
+            int todayTenths = Stats.TodayTenths(_app.Data);
+            var day = Stats.DayOf(_app.Data, DayKey.Today);
+            int minutes = day == null ? 0 : day.FocusedSec / 60;
+            string text = I18n.T("stats.line", streak, TomatoMath.Format(todayTenths), minutes);
             pt.TextCenter(text, pt.F(12f), t.TextMuted, r);
         }
 
