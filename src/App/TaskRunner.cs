@@ -39,11 +39,19 @@ namespace TomatoFocus.Core
                 var st = State;
                 if (st == null) return 0;
                 int extra = 0;
-                var phase = _app.Timer.Phase;
-                if (phase == TimerPhase.Focusing || phase == TimerPhase.Paused)
+                // 只统计**任务轮**自己的秒数：普通番茄钟与任务共用一个计时器，
+                // 不认 Preset 的话，随便跑个 5 分钟番茄钟都会被算进任务进度。
+                if (CountsForTaskProgress(_app.Timer.Preset, _app.Timer.Phase))
                     extra = _app.Timer.FocusedSeconds;
                 return st.AccumulatedFocusSec + extra;
             }
+        }
+
+        /// <summary>这一轮是否应计入任务进度：只有"任务轮"且处于专注/暂停时才计。</summary>
+        public static bool CountsForTaskProgress(string preset, TimerPhase phase)
+        {
+            if (!string.Equals(preset, "task", StringComparison.Ordinal)) return false;
+            return phase == TimerPhase.Focusing || phase == TimerPhase.Paused;
         }
 
         /// <summary>当前轮次序号（1 起）。</summary>
@@ -102,13 +110,33 @@ namespace TomatoFocus.Core
         }
 
         // --- 启动 / 轮次 ----------------------------------------------------
-        /// <summary>用当前 TaskConfig 启动任务。</summary>
+        /// <summary>启动失败的原因（文案键），供界面提示用；成功时为空。</summary>
+        public string LastStartError = "";
+
+        /// <summary>
+        /// 用当前 TaskConfig 启动任务。三道前置校验，任一不过都不开跑：
+        /// ① 计时器必须空闲——任务与普通番茄钟共用同一个 TimerEngine，直接开始会把正在跑的那一轮顶掉；
+        /// ② 不能已有进行中的任务；
+        /// ③ **目标程序必须正在运行**——否则会开出一轮"注定抓不到程序"的计时，
+        ///    1 秒后才被检测为"程序已退出"，用户看到的是"任务在跑、程序不在"的僵局。
+        /// </summary>
         public bool Start()
         {
+            LastStartError = "";
+
+            if (_app.Timer.Phase != TimerPhase.Idle) { LastStartError = "task.busy"; return false; }
+            if (State != null && State.IsActive) { LastStartError = "task.busy"; return false; }
+
             var cfg = _app.Data.TaskConfig;
-            if (string.IsNullOrEmpty(cfg.ProcessName)) return false;
+            if (string.IsNullOrEmpty(cfg.ProcessName)) { LastStartError = "task.setup.needProgram"; return false; }
+            if (!Native.ProcessAlive(TaskMath.Normalize(cfg.ProcessName)))
+            {
+                LastStartError = "task.start.needProgram";
+                return false;
+            }
+
             var rounds = TaskMath.BuildRounds(cfg.TotalFocusSeconds, cfg.FocusRoundSeconds);
-            if (rounds.Count == 0) return false;
+            if (rounds.Count == 0) { LastStartError = "task.busy"; return false; }
 
             var st = new TaskState();
             st.ProcessName = TaskMath.Normalize(cfg.ProcessName);
@@ -123,6 +151,7 @@ namespace TomatoFocus.Core
             st.StartedAt = DayKey.Stamp(DateTime.Now);
             _app.Data.CurrentTask = st;
             _lastSampleMs = -1;
+            ProgramAlive = true;
             _app.Data.Settings.NoteDraft = "";    // 新任务从空白笔记开始
             StartRound(0);
             _app.Save();
@@ -174,6 +203,9 @@ namespace TomatoFocus.Core
         {
             var st = State;
             if (st == null) return;
+            // 互斥：只有"轮次已结束、正在等选休息"（Timer 空闲）时才允许；
+            // 否则会把正在跑的那一轮顶掉（StartBreak 会清零 _elapsed）。
+            if (_app.Timer.Phase != TimerPhase.Idle) return;
             st.Status = TaskState.StatusRunning;
             st.ContinuousAwaySec = 0;
             _app.Timer.StartBreak(Math.Max(1, minutes) * 60);
@@ -187,6 +219,7 @@ namespace TomatoFocus.Core
         {
             var st = State;
             if (st == null) return;
+            if (_app.Timer.Phase != TimerPhase.Idle) return;   // 同上：空转时才允许跳轮
             _app.Timer.Reset();
             _app.DismissReminder();
             StartRound(st.RoundIndex);
@@ -234,7 +267,7 @@ namespace TomatoFocus.Core
         }
 
         // --- 中断恢复 -------------------------------------------------------
-        /// <summary>中断弹窗「继续任务」：重新开当前轮。</summary>
+        /// <summary>中断弹窗「继续任务」：程序还在就接着走（有存档时从断点续，否则重开当前轮）。</summary>
         public void ContinueFromInterrupted()
         {
             var st = State;
@@ -242,17 +275,99 @@ namespace TomatoFocus.Core
             if (!Native.ProcessAlive(st.ProcessName))
             {
                 st.Status = TaskState.StatusProgramGone;
+                ProgramAlive = false;
                 _app.Save();
                 return;
             }
+            ProgramAlive = true;
+
+            // 上一轮结束时留下的"选休息"卡片在这里必须作废：
+            // 用户点的是「继续任务」，不是「开始休息」，留着它就会在计时中继续显示，
+            // 而且随手一点休息时长就会把刚重启的这一轮顶掉。
+            _app.DismissReminder();
+
+            // 崩溃恢复的场景：时间已由存档还原成"暂停在断点"，直接接着走，
+            // 而不是把这一轮清零重来（重来会白白丢掉已经专注的分钟数）。
+            if (_app.Timer.Phase != TimerPhase.Idle)
+            {
+                if (_app.Timer.Phase != TimerPhase.Paused && _app.Timer.Phase != TimerPhase.PausedBreak)
+                {
+                    // 有别的计时在跑（普通番茄钟/休息）：不许抢断
+                    _app.ShowToast(I18n.T("task.busy"));
+                    return;
+                }
+                st.Status = TaskState.StatusRunning;
+                st.ContinuousAwaySec = 0;
+                _app.Timer.Resume();
+                _app.Save();
+                _app.BumpBeat();
+                return;
+            }
+
             StartRound(st.RoundIndex - 1);      // 重开当前这一轮
             _app.Save();
+            _app.BumpBeat();
         }
 
         /// <summary>中断弹窗「结束任务」：半收益结算（第 4 条）。</summary>
         public void EndFromInterrupted()
         {
             Finish(TaskMath.TaskOutcome.Abandoned);
+        }
+
+        // --- 目标程序检测（手动刷新 / 程序重新启动）--------------------------
+        /// <summary>
+        /// 目标程序当前是否在运行（每秒采样一次的结果缓存）。
+        /// 卡片与主按钮都读它，避免在绘制里反复枚举进程（那才是真正的性能杀手）。
+        /// </summary>
+        public bool ProgramAlive = true;
+
+        /// <summary>
+        /// 手动「重新检测」：立刻重新采样目标程序并让界面刷新一帧。
+        /// 不自动恢复计时——恢复与否由用户点「继续」决定。
+        /// </summary>
+        public bool Recheck()
+        {
+            var st = State;
+            if (st == null) return false;
+            ProgramAlive = Native.ProcessAlive(st.ProcessName);
+            _lastSampleMs = -1;                 // 解除 1 秒节流，下次 Update 立刻重新采样
+            _app.BumpBeat();                    // 强制重绘一帧
+            return ProgramAlive;
+        }
+
+        /// <summary>
+        /// 「程序已退出」后用户点「继续」：程序确实回来了才允许恢复。
+        /// 三种相位都要接住：暂停→续上；空闲（重启后没恢复出计时）→重开当前轮；
+        /// 有别的计时在跑→拒绝，绝不允许任务把普通番茄钟顶掉。
+        /// </summary>
+        public bool ResumeFromGone()
+        {
+            var st = State;
+            if (st == null) return false;
+            if (!Native.ProcessAlive(st.ProcessName)) { ProgramAlive = false; _app.BumpBeat(); return false; }
+            ProgramAlive = true;
+
+            switch (_app.Timer.Phase)
+            {
+                case TimerPhase.Paused:
+                case TimerPhase.PausedBreak:
+                    st.Status = TaskState.StatusRunning;
+                    st.ContinuousAwaySec = 0;
+                    _app.Timer.Resume();
+                    break;
+                case TimerPhase.Idle:
+                    _app.DismissReminder();
+                    StartRound(st.RoundIndex - 1);
+                    break;
+                default:
+                    _app.ShowToast(I18n.T("task.busy"));
+                    return false;      // Focusing / Break：别的计时正在跑
+            }
+
+            _app.Save();
+            _app.BumpBeat();
+            return true;
         }
 
         // --- 每帧驱动 -------------------------------------------------------
@@ -268,31 +383,45 @@ namespace TomatoFocus.Core
             var st = State;
             if (st == null) return;
 
-            // 程序启动时发现"上次还在跑"的任务 → 转异常中断，等用户决定
-            if (st.Status == TaskState.StatusRunning && _app.Timer.Phase == TimerPhase.Idle)
-            {
-                st.Status = TaskState.StatusInterrupted;
-                _app.Save();
-                return;
-            }
+            // 注意：这里**不再**把「Running + Timer 空闲」当成"异常中断"。
+            // 专注轮刚跑完、正在等用户选休息时，状态本来就是 Running + Idle，
+            // 以前那条判定会把正常流程误判成崩溃，弹窗盖在休息卡上（"任务被异常中断"误报）。
+            // 启动时的恢复由 AppState.Load（Running → Interrupted）负责，唯一且可靠。
             if (!st.IsActive) return;
 
             int nowMs = Environment.TickCount;
             if (_lastSampleMs >= 0 && unchecked(nowMs - _lastSampleMs) < 1000) return;
             _lastSampleMs = nowMs;
 
-            // 只有"专注轮正在走"时才做前台检测：休息轮不检测
+            // 只有"专注轮（含暂停）"才做前台检测：休息轮不检测
             if (_app.Timer.Phase != TimerPhase.Focusing && _app.Timer.Phase != TimerPhase.Paused) return;
 
-            // 目标程序是否还活着
-            if (!Native.ProcessAlive(st.ProcessName))
+            // 目标程序是否还活着（每秒一次，结果缓存给界面用）
+            bool alive = Native.ProcessAlive(st.ProcessName);
+            if (alive != ProgramAlive) { ProgramAlive = alive; _app.BumpBeat(); }
+
+            if (!alive)
             {
                 if (st.Status != TaskState.StatusProgramGone)
                 {
                     st.Status = TaskState.StatusProgramGone;
-                    _app.Timer.Pause();
+                    st.ContinuousAwaySec = 0;
+                    // 只有正在跑的时候才需要暂停；已经暂停/偏离暂停的状态不要去动它
+                    if (_app.Timer.Phase == TimerPhase.Focusing) _app.Timer.Pause();
                     _app.Save();
+                    _app.BumpBeat();
                 }
+                return;
+            }
+
+            // 程序回来了：把状态从"已退出"切到"可继续"，但仍要用户点「继续」，
+            // 不自动抢跑（他可能还没准备好）。
+            if (st.Status == TaskState.StatusProgramGone)
+            {
+                st.Status = TaskState.StatusRunning;
+                st.ContinuousAwaySec = 0;
+                _app.Save();
+                _app.BumpBeat();
                 return;
             }
 
@@ -301,20 +430,25 @@ namespace TomatoFocus.Core
 
             if (match)
             {
-                st.ContinuousAwaySec = 0;
-                if (st.Status == TaskState.StatusAway)
+                if (st.ContinuousAwaySec != 0 || st.Status == TaskState.StatusAway)
                 {
+                    st.ContinuousAwaySec = 0;
                     st.Status = TaskState.StatusRunning;
                     if (_app.Timer.Phase == TimerPhase.Paused) _app.Timer.Resume();
                     _app.Save();
+                    _app.BumpBeat();
                 }
                 return;
             }
 
-            // 偏离（软检测）：照常计时，只累计偏离秒数
+            // 偏离（软检测）：照常计时，只累计偏离秒数。
+            // **只有真的在专注时才累计**：已经暂停/已经自动暂停后还继续累加，
+            // 会让任务卡上的"已偏离 141 秒 / 还剩 0 秒自动暂停"一直涨个不停。
+            if (_app.Timer.Phase != TimerPhase.Focusing) return;
             st.AwaySec++;
             st.ContinuousAwaySec++;
-            if (st.ContinuousAwaySec >= AwayGraceSeconds && _app.Timer.Phase == TimerPhase.Focusing)
+            _app.BumpBeat();                     // 逐秒文案：让卡片立刻刷新
+            if (st.ContinuousAwaySec >= AwayGraceSeconds)
             {
                 _app.Timer.Pause();
                 st.Status = TaskState.StatusAway;

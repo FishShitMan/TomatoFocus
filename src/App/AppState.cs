@@ -137,14 +137,118 @@ namespace TomatoFocus.Core
             if (sec != _lastClockSecond)
             {
                 _lastClockSecond = sec;
+                SecondBeat++;                     // 逐秒文案的统一节拍（外壳据此重绘）
                 var h = ClockTick;
                 if (h != null) h(this, EventArgs.Empty);
             }
             CheckGreeting(DateTime.Now);
             if (Task != null) Task.Update();      // 任务：秒节拍采样前台、推进轮次、宽限自动暂停
+            UpdateJournal();                      // 计时运行态签到（崩溃恢复用）
         }
 
         private int _lastClockSecond = -1;
+
+        /// <summary>
+        /// 秒节拍计数：每跨一秒 +1。**只用于重绘**，不落盘、不置脏。
+        /// 用途：任务卡上的「已偏离 x 秒」这类"每秒自己变、却不经过任何状态变更"的文案，
+        /// 过去没有任何机制触发重绘，必须等鼠标划过才刷新。外壳比较这个计数即可每秒补一帧。
+        /// </summary>
+        public int SecondBeat { get; private set; }
+
+        /// <summary>强制补一拍（手动刷新等场景用：让外壳立刻重绘一次）。</summary>
+        public void BumpBeat() { SecondBeat++; }
+
+        // --- 崩溃恢复（1KB 计时存档）---------------------------------------
+        private int _journalSecond = -1;
+        private TimerPhase _journalPhase = (TimerPhase)(-1);
+        private bool _journalArmed;
+
+        /// <summary>本次启动是否从崩溃存档恢复了计时（供外壳弹一条提示）。</summary>
+        public bool RecoveredSession;
+
+        /// <summary>
+        /// 启动时尝试从 <c>session.journal</c> 恢复：**只恢复成暂停态**，绝不自动续跑。
+        /// 存档超过 24 小时、已经到点、格式不可信时直接丢弃。
+        /// 注意：这里只碰计时器，不碰日历/笔记/钱包——那些仍以 data.json 为准。
+        /// </summary>
+        public bool TryRecoverSession()
+        {
+            var snap = Journal.Read();
+            if (snap == null) return false;
+            if (snap.SavedLocal != DateTime.MinValue && (DateTime.Now - snap.SavedLocal).TotalHours > 24)
+            {
+                Journal.Clear();
+                return false;
+            }
+
+            TimerPhase phase;
+            switch (snap.Phase)
+            {
+                case "focusing":
+                case "paused": phase = TimerPhase.Paused; break;
+                case "break":
+                case "pausedBreak": phase = TimerPhase.PausedBreak; break;   // 休息也恢复成"暂停的休息"
+                default: Journal.Clear(); return false;
+            }
+
+            if (!Timer.Restore(phase, snap.PlannedSec, snap.BreakSec, snap.ElapsedSec, snap.Preset, snap.StartedLocal))
+            {
+                Journal.Clear();
+                return false;
+            }
+
+            _journalArmed = true;
+            _journalPhase = Timer.Phase;
+            _journalSecond = Timer.RemainingSeconds;
+            RecoveredSession = true;
+            Log.Info("recover: 上次计时已恢复为暂停 phase=" + Timer.Phase +
+                     " 剩余=" + Timer.RemainingSeconds + "s 计划=" + Timer.PlannedSeconds + "s");
+            return true;
+        }
+
+        /// <summary>
+        /// 计时运行态签到：阶段或剩余秒数一变就写一次（约 1 次/秒，1KB 定长文件），
+        /// 回到空闲就删掉存档。**只写 session.journal，不重写 data.json**，
+        /// 因此不会影响日历卡片与笔记内容。
+        /// </summary>
+        private void UpdateJournal()
+        {
+            var t = Timer;
+            if (t.Phase == TimerPhase.Idle)
+            {
+                if (_journalArmed) { Journal.Clear(); _journalArmed = false; }
+                _journalPhase = t.Phase;
+                _journalSecond = -1;
+                return;
+            }
+
+            int sec = t.RemainingSeconds;
+            if (_journalArmed && sec == _journalSecond && t.Phase == _journalPhase) return;
+            _journalPhase = t.Phase;
+            _journalSecond = sec;
+
+            var snap = new Journal.Snapshot();
+            snap.Phase = PhaseKey(t.Phase);
+            snap.PlannedSec = t.PlannedSeconds;
+            snap.BreakSec = t.BreakSeconds;
+            snap.ElapsedSec = t.FocusedSeconds;
+            snap.Preset = t.Preset ?? "25";
+            snap.StartedLocal = t.SessionStartedLocal;
+            snap.TaskRound = (Task != null && Task.State != null) ? Task.State.RoundIndex : 0;
+            if (Journal.Write(snap)) _journalArmed = true;
+        }
+
+        private static string PhaseKey(TimerPhase p)
+        {
+            switch (p)
+            {
+                case TimerPhase.Focusing: return "focusing";
+                case TimerPhase.Paused: return "paused";
+                case TimerPhase.Break: return "break";
+                case TimerPhase.PausedBreak: return "pausedBreak";
+                default: return "idle";
+            }
+        }
 
         // --- 分时段温馨问候 -------------------------------------------------
         /// <summary>待展示的问候（null 表示没有）。</summary>
@@ -216,6 +320,37 @@ namespace TomatoFocus.Core
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// 统一的「开始专注」入口：计时器忙、或任务进行中一律拒绝并给出文案键。
+        /// 主界面按钮、托盘菜单都走这里——以前托盘是直接调 Timer.StartFocus 的，
+        /// 于是任务进行中从托盘点「开始专注」照样能把任务轮顶掉。
+        /// </summary>
+        public bool TryStartFocus(int minutes, string preset, out string blockKey)
+        {
+            blockKey = "";
+            if (Timer.Phase != TimerPhase.Idle) { blockKey = "focus.busy"; return false; }
+            if (Task != null && Task.Active) { blockKey = "task.busy"; return false; }
+            Timer.StartFocus(minutes, preset);
+            return true;
+        }
+
+        /// <summary>
+        /// 启动时：任务还活着、却没有恢复出任何计时（计时器空闲）→ 转"待用户决定"。
+        /// 否则会出现"任务卡还在、左边是全新准备开始"的僵局：用户随便跑个普通番茄钟，
+        /// 还会被算进任务进度。
+        /// </summary>
+        public void MarkTaskNeedsAttention()
+        {
+            var st = Data.CurrentTask;
+            if (st == null || !st.IsActive) return;
+            if (st.Status == TaskState.StatusInterrupted) return;
+            if (Timer.Phase != TimerPhase.Idle) return;      // 已恢复出计时：不用打扰
+
+            st.Status = TaskState.StatusInterrupted;
+            Save();
+            Log.Info("task: 启动时任务仍活跃但没有可恢复的计时 → 转异常中断，等待用户决定");
         }
 
         public void ApplyTheme()
@@ -296,6 +431,10 @@ namespace TomatoFocus.Core
 
             var unlocked = Achievements.Evaluate(Data, DateTime.Now);
             Save();
+            // 记录已落盘，恢复点必须立刻作废：否则"刚好崩在收尾的那 30ms 里"，
+            // 下次启动会把这一轮当成没跑完而恢复，等于重复结算。
+            Journal.Clear();
+            _journalArmed = false;
 
             // 先把本次解锁数交给外壳：由它二选一播放"成就音/完成音"，
             // 避免完成音与成就音先后各响一次而听起来像重复播放。
@@ -346,6 +485,9 @@ namespace TomatoFocus.Core
             _continuousFocusSeconds = 0;
             var unlocked = Achievements.Evaluate(Data, DateTime.Now);
             Save();
+            // 同 RecordSession：任务结算一旦落盘，恢复点即刻作废，避免重复结算
+            Journal.Clear();
+            _journalArmed = false;
             LastUnlockedCount = unlocked.Count;
 
             var rh = SessionRecorded;

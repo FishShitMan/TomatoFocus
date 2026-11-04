@@ -32,9 +32,16 @@ namespace TomatoFocus.Core
         /// <summary>降档后的常驻帧间隔（约 6fps）：没人看的时候不烧 CPU。</summary>
         public const int AmbientIdleMs = 160;
 
+        /// <summary>
+        /// 无操作降档总开关。false = 暂时禁用降档（恒按 30fps 跑），用于排查卡顿。
+        /// 「解封」时把这里改回 true 即可，其余代码无需改动。
+        /// </summary>
+        public static bool DegradeEnabled = false;
+
         /// <summary>按"距上次输入操作的秒数"取常驻档间隔：活跃 30fps，空闲约 6fps。</summary>
         public static int AmbientMs(double idleSeconds)
         {
+            if (!DegradeEnabled) return SlowMs;
             return idleSeconds < AmbientIdleAfterSeconds ? SlowMs : AmbientIdleMs;
         }
         /// <summary>计时进行中：进度环与时钟每秒才变一次。</summary>

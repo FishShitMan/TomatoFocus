@@ -8,7 +8,9 @@ namespace TomatoFocus.Core
         Idle,
         Focusing,
         Paused,
-        Break
+        Break,
+        /// <summary>休息被暂停（休眠挂起 / 崩溃恢复）。刻意加在末尾：不影响既有枚举值。</summary>
+        PausedBreak
     }
 
     internal sealed class FocusCompletedEventArgs : EventArgs
@@ -69,11 +71,14 @@ namespace TomatoFocus.Core
 
         public int FocusedSeconds { get { return (int)Math.Floor(_elapsed); } }
 
+        /// <summary>当前（或暂停前的）阶段是不是休息。</summary>
+        public bool IsBreakPhase { get { return Phase == TimerPhase.Break || Phase == TimerPhase.PausedBreak; } }
+
         public int RemainingSeconds
         {
             get
             {
-                int total = Phase == TimerPhase.Break ? BreakSeconds : PlannedSeconds;
+                int total = IsBreakPhase ? BreakSeconds : PlannedSeconds;
                 int left = total - FocusedSeconds;
                 return left < 0 ? 0 : left;
             }
@@ -83,7 +88,7 @@ namespace TomatoFocus.Core
         {
             get
             {
-                int total = Phase == TimerPhase.Break ? BreakSeconds : PlannedSeconds;
+                int total = IsBreakPhase ? BreakSeconds : PlannedSeconds;
                 if (total <= 0) return 0;
                 double p = _elapsed / total;
                 return p < 0 ? 0 : (p > 1 ? 1 : p);
@@ -128,6 +133,15 @@ namespace TomatoFocus.Core
 
         public void Resume()
         {
+            // 暂停的休息要回到"休息"，不能回到"专注"（否则剩余时间会按专注时长算）
+            if (Phase == TimerPhase.PausedBreak)
+            {
+                Phase = TimerPhase.Break;
+                _lastMono = MonoNow();
+                _lastWall = WallNow();
+                RaiseStateChanged();
+                return;
+            }
             if (Phase != TimerPhase.Paused) return;
             Phase = TimerPhase.Focusing;
             _lastMono = MonoNow();
@@ -138,6 +152,8 @@ namespace TomatoFocus.Core
         /// <summary>提前结束本轮，返回实际专注秒数；由调用方负责结算（半收益）。</summary>
         public int StopEarly()
         {
+            // 只有"专注中/专注暂停"才能结算；休息阶段调用等于凭空记一笔，直接忽略
+            if (Phase != TimerPhase.Focusing && Phase != TimerPhase.Paused) return 0;
             int focused = FocusedSeconds;
             var args = new FocusCompletedEventArgs();
             args.FocusedSeconds = focused;
@@ -165,7 +181,7 @@ namespace TomatoFocus.Core
 
         public void SkipBreak()
         {
-            if (Phase != TimerPhase.Break) return;
+            if (Phase != TimerPhase.Break && Phase != TimerPhase.PausedBreak) return;
             Phase = TimerPhase.Idle;
             _elapsed = 0;
             RaiseStateChanged();
@@ -177,6 +193,31 @@ namespace TomatoFocus.Core
             _elapsed = 0;
             SuspendDetected = false;
             RaiseStateChanged();
+        }
+
+        /// <summary>
+        /// 从崩溃存档恢复。**只恢复成暂停态**（专注暂停 / 休息暂停），绝不自动续跑——
+        /// 用户可能已经离开，自动继续等于凭空给他记时间。
+        /// </summary>
+        /// <returns>恢复成功返回 true；参数不可信（阶段不对、已经到点）返回 false。</returns>
+        public bool Restore(TimerPhase phase, int plannedSec, int breakSec, int elapsedSec, string preset, DateTime startedLocal)
+        {
+            if (phase != TimerPhase.Paused && phase != TimerPhase.PausedBreak) return false;
+            int planned = plannedSec < 60 ? 60 : plannedSec;
+            int brk = breakSec < 30 ? 30 : breakSec;
+            if (elapsedSec < 0) elapsedSec = 0;
+            if (elapsedSec >= (phase == TimerPhase.PausedBreak ? brk : planned)) return false;   // 已经到点
+
+            Phase = phase;
+            PlannedSeconds = planned;
+            BreakSeconds = brk;
+            Preset = string.IsNullOrEmpty(preset) ? "25" : preset;
+            _elapsed = elapsedSec;
+            SessionStartedLocal = startedLocal == DateTime.MinValue ? DateTime.Now : startedLocal;
+            SuspendDetected = false;
+            _lastMono = MonoNow();
+            _lastWall = WallNow();
+            return true;
         }
 
         /// <summary>由 UI 渲染节拍驱动（约每秒 4 次即可）。</summary>
@@ -197,10 +238,11 @@ namespace TomatoFocus.Core
             {
                 _elapsed += dMono;
 
-                if (slept && Phase == TimerPhase.Focusing)
+                if (slept)
                 {
+                    // 专注与休息都要自动暂停：睡一觉回来接着数，等于把休息也算成专注/把专注算成休息
                     SuspendDetected = true;
-                    Phase = TimerPhase.Paused;
+                    Phase = (Phase == TimerPhase.Break) ? TimerPhase.PausedBreak : TimerPhase.Paused;
                     RaiseStateChanged();
                     var sh = Suspended;
                     if (sh != null) sh(this, EventArgs.Empty);

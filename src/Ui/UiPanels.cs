@@ -1147,6 +1147,12 @@ namespace TomatoFocus.Ui
 
             var t = pt.T;
             var lr = _leftRect;
+
+            // 确认条显示时先用一层全窗口热区挡住后方控件：否则点击会穿透到下面的
+            // 预设/开始等按钮，误触后行为不可预期（BUG 7）。本热区先注册，条内按钮后注册因而优先。
+            var backdrop = new RectangleF(0, 0, Bounds.Width, Bounds.Height);
+            Hot("cfBackdrop", backdrop, delegate { _confirmStop = false; A("confirm").Set(0f); });
+
             float h = 66f;
             var bar = new RectangleF(lr.Left, lr.Bottom - h - 6 - (1 - k) * 12, lr.Width, h);
             _confirmBarRect = bar;

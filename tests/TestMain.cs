@@ -22,7 +22,17 @@ namespace TomatoFocus.Tests
         public static int Main(string[] args)
         {
             string temp = Path.Combine(Path.GetTempPath(), "TomatoFocus.Tests." + Guid.NewGuid().ToString("N").Substring(0, 8));
-            Directory.CreateDirectory(temp);
+            try
+            {
+                Directory.CreateDirectory(temp);
+            }
+            catch (Exception)
+            {
+                // 受限环境下 %TEMP% 可能不可写（UnauthorizedAccessException）：
+                // 退回到 exe 同目录建测试数据目录，保证测试照样能跑。
+                temp = Path.Combine(AppPaths.ExeDir, "testdata-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                Directory.CreateDirectory(temp);
+            }
             AppPaths.OverrideDataDir(temp);
 
             try
@@ -78,6 +88,9 @@ namespace TomatoFocus.Tests
                 TestPlannedBugFixes();
                 TestYearViewColors();
                 TestTaskSystem();
+                TestSessionRecovery();
+                TestTaskStateGuards();
+                TestBugFixesBatch1();
             }
             catch (Exception ex)
             {
@@ -93,6 +106,7 @@ namespace TomatoFocus.Tests
             Console.WriteLine("通过 " + _pass + " / 失败 " + _fail);
             return _fail == 0 ? 0 : 1;
         }
+
 
         private static void Group(string name)
         {
@@ -1274,7 +1288,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.6.0");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.6.1");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -2564,10 +2578,14 @@ namespace TomatoFocus.Tests
             I18n.Load(I18n.DefaultLang);
 
             // ① 降档曲线：活跃 30fps、空闲 10 秒后降到约 6fps
+            // 降档当前为排查态（DegradeEnabled=false），这里显式打开验证曲线，测完恢复原状。
+            bool degradeWas = FrameTiming.DegradeEnabled;
+            FrameTiming.DegradeEnabled = true;
             Eq("刚开始（0 秒）用活跃档", FrameTiming.AmbientMs(0), FrameTiming.SlowMs);
             Eq("9.9 秒仍是活跃档", FrameTiming.AmbientMs(9.9), FrameTiming.SlowMs);
             Eq("10 秒降到空闲档", FrameTiming.AmbientMs(10.0), FrameTiming.AmbientIdleMs);
             Eq("长时间空闲维持空闲档", FrameTiming.AmbientMs(3600), FrameTiming.AmbientIdleMs);
+            FrameTiming.DegradeEnabled = degradeWas;
             True("活跃档约 30fps", Math.Abs(1000.0 / FrameTiming.SlowMs - 30.3) < 1.0);
             True("空闲档约 6fps", Math.Abs(1000.0 / FrameTiming.AmbientIdleMs - 6.25) < 0.5);
             True("降档阈值就是 10 秒", Math.Abs(FrameTiming.AmbientIdleAfterSeconds - 10.0) < 0.001);
@@ -2873,7 +2891,12 @@ namespace TomatoFocus.Tests
                 "task.break.title", "task.break.body", "task.break.option", "task.break.skipToNext",
                 "task.confirm.hint", "task.interrupt.title", "task.interrupt.grabbing", "task.interrupt.found",
                 "task.interrupt.notFound", "task.interrupt.refresh", "task.interrupt.cont", "task.interrupt.end",
-                "task.interrupt.hint", "task.settled", "task.settled.none"
+                "task.interrupt.hint", "task.settled", "task.settled.none",
+                "task.state.back", "task.wait.programBack", "task.away.paused",
+                "task.continue", "task.recheck", "task.recheck.ok", "task.recheck.fail",
+                "task.resume.needProgram", "task.busy",
+                "focus.recovered", "focus.recovered.break", "break.paused", "break.resume",
+                "tray.tip.breakPaused"
             };
             foreach (string key in required)
                 True("必备文案 " + key, I18n.T(key) != key);
@@ -2957,6 +2980,298 @@ namespace TomatoFocus.Tests
             // 旧数据缺任务字段不崩
             var old = Store.FromJson(JsonObj.Parse("{\"schema\":1}"));
             True("旧数据无任务字段可读", old.CurrentTask == null && old.TaskConfig != null);
+        }
+
+        /// <summary>崩溃恢复：1KB 双槽存档、只恢复成暂停、完成即删且不动日历/笔记。</summary>
+        private static void TestSessionRecovery()
+        {
+            Group("崩溃恢复（计时存档）");
+            Journal.Clear();
+
+            // ① 存档大小固定 1KB，写读一致
+            var snap = new Journal.Snapshot();
+            snap.Phase = "focusing";
+            snap.PlannedSec = 25 * 60;
+            snap.BreakSec = 300;
+            snap.ElapsedSec = 600;
+            snap.Preset = "25";
+            snap.StartedLocal = new DateTime(2026, 11, 4, 22, 0, 0);
+            True("存档写入成功", Journal.Write(snap));
+            Eq("存档固定 1KB", new FileInfo(Journal.FilePath).Length, (long)Journal.FileBytes);
+            var back = Journal.Read();
+            True("能读回存档", back != null);
+            Eq("阶段一致", back.Phase, "focusing");
+            Eq("已过秒数一致", back.ElapsedSec, 600);
+            Eq("计划秒数一致", back.PlannedSec, 1500);
+            Eq("档位一致", back.Preset, "25");
+
+            // ② 抗撕裂：两槽交替；把"最新的那槽"打坏，仍要能读回上一槽
+            var s2 = new Journal.Snapshot();
+            s2.Phase = "paused";
+            s2.PlannedSec = 15 * 60;
+            s2.ElapsedSec = 120;
+            s2.Preset = "15";
+            True("第二次写入成功", Journal.Write(s2));
+            byte[] raw = File.ReadAllBytes(Journal.FilePath);
+            var newest = Journal.Read();
+            int newestSlot = (int)(newest.Seq % Journal.SlotCount);
+            for (int i = 0; i < 8; i++) raw[newestSlot * Journal.SlotSize + i] = 0;   // 弄坏魔数与头部
+            File.WriteAllBytes(Journal.FilePath, raw);
+            var survived = Journal.Read();
+            True("坏槽后仍能读回", survived != null);
+            Eq("回退到上一槽", survived.ElapsedSec, 600);
+
+            // ③ 删除
+            Journal.Clear();
+            True("删除后文件不存在", !Journal.Exists);
+            True("删除后读不到", Journal.Read() == null);
+
+            // ④ 计时器恢复：只恢复到暂停，秒数精确
+            var timer = new TimerEngine();
+            True("恢复专注暂停", timer.Restore(TimerPhase.Paused, 1500, 300, 600, "25", DateTime.Now));
+            Eq("恢复后是暂停态", (int)timer.Phase, (int)TimerPhase.Paused);
+            Eq("剩余秒数精确到秒", timer.RemainingSeconds, 900);
+            True("可以继续", timer.Phase == TimerPhase.Paused);
+            timer.Resume();
+            Eq("继续后回到专注", (int)timer.Phase, (int)TimerPhase.Focusing);
+            Eq("继续后进度保留", timer.FocusedSeconds, 600);
+
+            // ⑤ 休息也恢复成"暂停的休息"，继续要回到休息
+            var t2 = new TimerEngine();
+            True("恢复休息暂停", t2.Restore(TimerPhase.PausedBreak, 1500, 300, 120, "25", DateTime.Now));
+            Eq("恢复后是休息暂停", (int)t2.Phase, (int)TimerPhase.PausedBreak);
+            Eq("剩余按休息时长算", t2.RemainingSeconds, 180);
+            True("休息阶段标记正确", t2.IsBreakPhase);
+            t2.Resume();
+            Eq("继续后回到休息", (int)t2.Phase, (int)TimerPhase.Break);
+            t2.SkipBreak();
+            Eq("跳过休息回到空闲", (int)t2.Phase, (int)TimerPhase.Idle);
+
+            // ⑥ 已经到点的存档不再恢复
+            var t3 = new TimerEngine();
+            True("到点的不恢复", !t3.Restore(TimerPhase.Paused, 300, 300, 300, "5", DateTime.Now));
+            Eq("拒绝后仍是空闲", (int)t3.Phase, (int)TimerPhase.Idle);
+
+            // ⑦ 休息阶段不允许被当成专注结算（否则会凭空记一笔）
+            var t4 = new TimerEngine();
+            int completed = 0;
+            t4.FocusCompleted += delegate { completed++; };
+            t4.StartBreak(300);
+            Eq("休息中提前结束无效", t4.StopEarly(), 0);
+            Eq("休息中不触发结算", completed, 0);
+            Eq("休息状态保持不变", (int)t4.Phase, (int)TimerPhase.Break);
+
+            // ⑧ 端到端：写存档 → 新进程 Load → 恢复成暂停，且不自动续跑
+            Journal.Clear();
+            var e2e = new Journal.Snapshot();
+            e2e.Phase = "focusing";
+            e2e.PlannedSec = 1500;
+            e2e.ElapsedSec = 600;
+            e2e.Preset = "25";
+            Journal.Write(e2e);
+            var app = new AppState();
+            True("启动时恢复成功", app.TryRecoverSession());
+            Eq("恢复成暂停", (int)app.Timer.Phase, (int)TimerPhase.Paused);
+            Eq("恢复后剩余精确", app.Timer.RemainingSeconds, 900);
+            app.Tick();
+            Eq("恢复后仍保持暂停（不自动续跑）", (int)app.Timer.Phase, (int)TimerPhase.Paused);
+            Eq("恢复后剩余不变", app.Timer.RemainingSeconds, 900);
+
+            // ⑨ 完成：存档自动删除，但日历卡片与笔记照常落盘
+            Journal.Clear();
+            var app2 = new AppState();
+            app2.Data.Settings.NoteDraft = "崩溃前的笔记";
+            app2.Timer.StartFocus(25, "25");
+            app2.Tick();
+            True("计时中生成存档", Journal.Exists);
+            int before = app2.Data.Sessions.Count;
+            app2.Timer.DebugCompleteNow();      // 走正常完成 → 写记录 + 保存
+            app2.Tick();                         // 回到空闲 → 删存档
+            True("完成后存档已删除", !Journal.Exists);
+            Eq("日历卡片仍然写入", app2.Data.Sessions.Count, before + 1);
+            Eq("笔记内容仍随记录保存", app2.Data.Sessions[app2.Data.Sessions.Count - 1].Note, "崩溃前的笔记");
+            True("完成后不再残留说明", Journal.Read() == null);
+
+            Journal.Clear();
+        }
+
+        /// <summary>任务状态机与互斥：计时中不许开任务、程序不在不许继续、弹窗排版不压按钮。</summary>
+        private static void TestTaskStateGuards()
+        {
+            Group("任务状态机与互斥");
+
+            // ① 计时中不允许开始任务（否则会把普通番茄钟顶掉）
+            string self = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
+            var app = new AppState();
+            app.Timer.StartFocus(25, "25");
+            True("计时中拒绝开始任务", !app.Task.Start());
+            Eq("拒绝原因=计时中", app.Task.LastStartError, "task.busy");
+            app.Timer.Reset();
+
+            // ② 目标程序没在跑：不许开始（否则会开出一轮"注定抓不到程序"的计时）
+            app.Data.TaskConfig.ProcessName = "no_such_process_zzz";
+            app.Data.TaskConfig.TotalFocusSeconds = 30 * 60;
+            app.Data.TaskConfig.FocusRoundSeconds = 15 * 60;
+            app.Data.TaskConfig.BreakRoundSeconds = 5 * 60;
+            True("程序不在时拒绝开始任务", !app.Task.Start());
+            Eq("拒绝原因=目标程序未运行", app.Task.LastStartError, "task.start.needProgram");
+            True("被拒后没有留下任务", app.Data.CurrentTask == null);
+
+            // ③ 换成真在运行的程序：空闲时可以开始，并且真的跑起来
+            app.Data.TaskConfig.ProcessName = self;
+            True("空闲且程序在跑时可以开始任务", app.Task.Start());
+            Eq("任务开始后进入专注", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            Eq("任务轮次为 1", app.Data.CurrentTask.RoundIndex, 1);
+
+            // ④ 轮次未结束（计时中）时，休息卡的两个动作都不许执行
+            app.Task.TakeBreak(5);
+            Eq("计时中不允许开始休息", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            app.Task.SkipBreak();
+            Eq("计时中不允许跳过休息", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+
+            // ⑤ 目标程序不在：继续/恢复都要被拒
+            var st = app.Data.CurrentTask;
+            st.ProcessName = "no_such_process_zzz";
+            st.Status = TaskState.StatusProgramGone;
+            app.Timer.StartFocus(15, "task");
+            app.Timer.Pause();
+            True("程序不在：重新检测返回 false", !app.Task.Recheck());
+            True("程序不在：拒绝从退出态恢复", !app.Task.ResumeFromGone());
+            Eq("程序不在：仍是暂停", (int)app.Timer.Phase, (int)TimerPhase.Paused);
+
+            // ⑥ 程序回来了：重新检测能识别，并且允许恢复
+            st.ProcessName = self;
+            True("程序在：重新检测返回 true", app.Task.Recheck());
+            True("程序在：允许从退出态恢复", app.Task.ResumeFromGone());
+            Eq("恢复后回到专注", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+
+            // ⑦ 「继续任务」必须清掉上一轮遗留的休息卡
+            st.Status = TaskState.StatusInterrupted;
+            app.Timer.StartFocus(15, "task");
+            app.Timer.Pause();
+            app.Pending = new Reminder();
+            app.Task.ContinueFromInterrupted();
+            True("继续任务后清掉遗留休息卡", app.Pending == null);
+            Eq("继续任务后回到专注", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            app.Pending = null;
+            app.Timer.Reset();
+
+            // ⑧ 重新检测/继续 的三相位：空闲要能重开当前轮，有别的计时在跑要拒绝
+            var app2 = new AppState();
+            app2.Data.CurrentTask = new TaskState();
+            app2.Data.CurrentTask.ProcessName = self;
+            app2.Data.CurrentTask.TotalFocusSeconds = 30 * 60;
+            app2.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app2.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app2.Data.CurrentTask.RoundsTotal = 2;
+            app2.Data.CurrentTask.RoundIndex = 1;
+            app2.Data.CurrentTask.Status = TaskState.StatusProgramGone;
+            app2.Timer.Reset();
+            True("空闲时点继续会重开当前轮", app2.Task.ResumeFromGone());
+            Eq("重开后进入专注", (int)app2.Timer.Phase, (int)TimerPhase.Focusing);
+            Eq("重开后状态回到 running", app2.Data.CurrentTask.Status, TaskState.StatusRunning);
+
+            app2.Timer.StartFocus(5, "25");                 // 一个普通番茄钟正在跑
+            app2.Data.CurrentTask.Status = TaskState.StatusProgramGone;
+            True("有别的计时在跑时拒绝恢复任务", !app2.Task.ResumeFromGone());
+            Eq("拒绝后普通番茄钟不受影响", (int)app2.Timer.Phase, (int)TimerPhase.Focusing);
+
+            // ⑨ 任务进度只统计任务轮：普通番茄钟/其它相位一律不算
+            True("任务轮计入进度", TaskRunner.CountsForTaskProgress("task", TimerPhase.Focusing));
+            True("任务轮暂停也计入", TaskRunner.CountsForTaskProgress("task", TimerPhase.Paused));
+            True("普通轮不计入进度", !TaskRunner.CountsForTaskProgress("25", TimerPhase.Focusing));
+            True("空闲相位不计入", !TaskRunner.CountsForTaskProgress("task", TimerPhase.Idle));
+
+            // ⑩ 统一的开始入口：计时器忙 / 任务进行中都要拒绝
+            var app3 = new AppState();
+            string why;
+            app3.Timer.StartFocus(25, "25");
+            True("计时中拒绝统一入口", !app3.TryStartFocus(15, "15", out why));
+            Eq("原因=focus.busy", why, "focus.busy");
+            app3.Timer.Reset();
+            app3.Data.CurrentTask = new TaskState();
+            app3.Data.CurrentTask.Status = TaskState.StatusRunning;
+            True("任务进行中拒绝开始专注", !app3.TryStartFocus(15, "15", out why));
+            Eq("原因=task.busy", why, "task.busy");
+
+            // ⑪ 启动时"任务还活着但没有可恢复的计时"→ 转待决，避免计时器空转的僵局
+            var app4 = new AppState();
+            app4.Data.CurrentTask = new TaskState();
+            app4.Data.CurrentTask.Status = TaskState.StatusProgramGone;
+            app4.Timer.Reset();
+            app4.MarkTaskNeedsAttention();
+            Eq("启动时空闲任务转待决", app4.Data.CurrentTask.Status, TaskState.StatusInterrupted);
+
+            // ⑫ 中断弹窗排版：提示文字必须在按钮右侧，且不与任何按钮相交
+            var card = new RectangleF(100, 100, 520, 208);
+            var layout = UiRoot.InterruptLayout(card);
+            var contR = layout[0];
+            var endR = layout[1];
+            var hintR = layout[2];
+            True("提示文字有可用宽度", hintR.Width > 24f);
+            True("提示与「继续任务」不重叠", !hintR.IntersectsWith(contR));
+            True("提示与「结束任务」不重叠", !hintR.IntersectsWith(endR));
+            True("提示在按钮右侧", hintR.Left >= endR.Right);
+            True("提示不出卡片", card.Contains(hintR));
+            True("两个按钮不重叠", !contR.IntersectsWith(endR));
+
+            // ⑬ 秒节拍：跨过一秒必须推进（逐秒文案靠它补帧）
+            int beat = app.SecondBeat;
+            for (int i = 0; i < 30 && app.SecondBeat == beat; i++)
+            {
+                System.Threading.Thread.Sleep(100);
+                app.Tick();
+            }
+            True("秒节拍会随时间推进", app.SecondBeat > beat);
+            int beatNow = app.SecondBeat;
+            app.BumpBeat();
+            Eq("手动补帧计数 +1", app.SecondBeat, beatNow + 1);
+
+            // ⑭ 开局字段：ProgramAlive 默认可用，不会一上来就画成"程序已退出"
+            var fresh = new AppState();
+            True("初始 ProgramAlive 为真", fresh.Task.ProgramAlive);
+
+            Journal.Clear();
+        }
+
+        /// <summary>第一批 BUG 回归：时钟长形态、确认条遮挡热区。</summary>
+        private static void TestBugFixesBatch1()
+        {
+            Group("第一批 BUG 回归");
+
+            // BUG 5/6：超过 1 小时走 h:mm:ss（7 字符），字号按最长形态预留，不随秒数变化
+            Eq("1 小时时钟为 h:mm:ss", TomatoMath.FormatClock(3600).Length, 7);
+            Eq("59 分 59 秒仍为 mm:ss", TomatoMath.FormatClock(3599).Length, 5);
+            Eq("2 小时时钟文本", TomatoMath.FormatClock(7200), "2:00:00");
+
+            // BUG 7：确认条显示时必须有全窗口遮挡热区，挡住后方按钮
+            var app = new AppState();
+            app.Data = new AppData();
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+            app.Timer.SetPresetMinutes(25, "25");
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                Settle(ui, g, 4);
+
+                RectangleF bg;
+                True("未确认时没有遮挡热区", !ui.TryGetHotspot("cfBackdrop", out bg));
+
+                ui.SetConfirmStop(true);
+                Settle(ui, g, 12);
+                True("确认条显示时有遮挡热区", ui.TryGetHotspot("cfBackdrop", out bg));
+                True("遮挡热区覆盖整个窗口", bg.Width >= 1039f && bg.Height >= 699f,
+                    bg.Width.ToString("0") + "x" + bg.Height.ToString("0"));
+
+                RectangleF no;
+                True("条内按钮仍可命中", ui.TryGetHotspot("cfNo", out no));
+                True("条内按钮在遮挡层之上", no.Top > 0f);
+            }
         }
 
         /// <summary>更新规划【BUG修复】三条的回归：抽屉收起姿态 / 年视图 / 默认奖励显示。</summary>

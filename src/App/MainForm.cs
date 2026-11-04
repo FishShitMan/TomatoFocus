@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Threading;
 using System.Windows.Forms;
@@ -41,6 +42,14 @@ namespace TomatoFocus.App
 
         /// <summary>是否把每秒帧统计写进日志（--frames-log，用于验证降档）。</summary>
         public static bool LogFrames;
+
+        /// <summary>
+        /// 是否把"每一次绘制是从哪条消息来的"写进日志（--paint-log）。
+        /// 用途：渲染泵在 250ms 档下每秒最多只能产生 4 次绘制请求，一旦日志里
+        /// 总次数明显高于泵帧数，多出来的那部分就是**泵之外的第二重绘源**，
+        /// 而"触发="栏会直接点出是 WM_SIZE / WM_DPICHANGED 还是 WM_TIMER…
+        /// </summary>
+        public static bool LogPaints;
 
         public event EventHandler HideToTrayRequested;
         public event EventHandler ExitRequested;
@@ -269,10 +278,24 @@ namespace TomatoFocus.App
             bool secondChanged = sec != _lastPaintSecond;
             bool uiDirty = _ui.TakeDirty();
 
+            // 逐秒文案的统一节拍：任务卡上的「已偏离 x 秒」这类文字每秒自己变，
+            // 但既不改 RemainingSeconds 也不置脏，过去只能等鼠标划过才刷新
+            // （"数字不实时、动一下鼠标才对"就是这个）。这里按秒补一帧整窗重绘。
+            bool secondBeat = _app.SecondBeat != _lastSecondBeat;
+            _lastSecondBeat = _app.SecondBeat;
+            var taskNow = _app.Data.CurrentTask;
+            bool taskLive = taskNow != null && taskNow.IsActive;
+
             // 本帧是否**必须**整窗重绘：有动画在跑、动画刚结束（要擦掉最后一帧残留）、
             // 界面状态变化、或秒数变了（时钟与进度环每秒才变一次）。
             // 把"是否必须整窗重绘"独立出来，是为了让计时中也能安全走快路径。
-            bool needFullRedraw = animating || _wasAnimating || uiDirty || secondChanged;
+            //
+            // **运行中不再整窗重绘**：以前这里串了 running，于是计时中每帧都必须整窗——
+            // "--paint-log" 实测 33ms 档下 `整帧=29/29、局部=0`，计数环的局部重绘因此
+            // 一次都跑不到（那不是"暂时摘除"，是**永远不可达**）。现在只有"秒变化"
+            // 那一下才整窗，其余帧由 _fastRect 只刷环/勋章/光标。
+            bool needFullRedraw = animating || _wasAnimating || uiDirty || secondChanged ||
+                                  (secondBeat && taskLive);
 
             // 帧率策略；_frameInterval 由渲染泵线程读取，改档无需重建计时器。
             // 只有勋章在变时走"勋章快路径"：贴缓存 + 只重画那几枚勋章，因此可以给到 30fps。
@@ -286,7 +309,10 @@ namespace TomatoFocus.App
             // InteractionBurst 只负责把帧率拉到 60fps，不再强制整窗重绘——真正需要整窗重绘的
             // 时刻（悬停/按压动画）都已经由 animating/uiDirty 覆盖，不必再靠爆发档兜底。
             bool ambientMedal = _ui.CanDrawMedalOnly && ContainsFocus && Visible;
-            _medalOnlyFrame = ambientMedal && _cacheValid && CacheMatches() && !needFullRedraw;
+            // 计数环不是装饰：窗口可见时就算没有焦点也该跟着走（否则每秒才跳一格）。
+            // 代价是每帧一次约 0.5ms 的局部贴图，比"整窗 30fps"便宜两个数量级。
+            bool ringOnly = _ui.CanDrawRingOnly && Visible;
+            _medalOnlyFrame = (ambientMedal || ringOnly) && _cacheValid && CacheMatches() && !needFullRedraw;
             if (needFullRedraw) _fullRedrawPending = true;
 
             // 快路径本帧只需刷新"勋章 + 笔记光标"那一小块：算出它的设备像素矩形，
@@ -295,7 +321,11 @@ namespace TomatoFocus.App
             _fastRect = Rectangle.Empty;
             if (_medalOnlyFrame)
             {
+                // 无效区 = 勋章/光标区域 ∪ 计数环区域
                 var ar = _ui.AmbientDirtyRect;
+                var rr = _ui.RingDirtyRect;
+                if (rr.Width > 0.5f && rr.Height > 0.5f)
+                    ar = ar.Width > 0.5f && ar.Height > 0.5f ? RectangleF.Union(ar, rr) : rr;
                 if (ar.Width > 0.5f && ar.Height > 0.5f)
                 {
                     int x0 = (int)Math.Floor(ar.Left * _scale) - 2;
@@ -315,14 +345,16 @@ namespace TomatoFocus.App
             int target = !Visible ? FrameTiming.IdleMs
                        : (animating || _ui.InteractionBurst > 0) ? FrameTiming.BurstMs
                        : (_medalOnlyFrame ? ambientMs
-                       : (running ? FrameTiming.RunningMs : FrameTiming.IdleMs));
-            // 帧统计：只在 --perf 自检或显式开启时输出，避免平时刷屏
-            if ((probe != null || LogFrames) && now - _lastAmbientLog > 1.0 && _ui.CanDrawMedalOnly)
+                       : (running ? FrameTiming.SlowMs : FrameTiming.IdleMs));            // 帧统计：只在 --perf 自检或显式开启时输出，避免平时刷屏
+            // 帧统计：只在 --perf 自检或显式开启时输出，避免平时刷屏。
+            // 注意：不要再串 _ui.CanDrawMedalOnly —— 那会让"没装备勋章/正在跑计时"时
+            // 一行都不打，恰是排查卡顿最需要的场景。
+            if ((probe != null || LogFrames) && now - _lastAmbientLog > 1.0)
             {
                 _lastAmbientLog = now;
                 Log.Info("frames/s: 快路径=" + (_fastPathFrames - _lastFast) + " 全窗=" + (_fullFrames - _lastFull) +
                          " 档位=" + _frameInterval + "ms 空闲=" + idleSeconds.ToString("0.0") + "s" +
-                         " animating=" + animating + " ambient=" + ambientMedal +
+                         " animating=" + animating + " ambient=" + ambientMedal + " ring=" + ringOnly +
                          " 勋章数=" + _ui.AmbientMedalCount + " focus=" + ContainsFocus);
                 _lastFast = _fastPathFrames;
                 _lastFull = _fullFrames;
@@ -333,13 +365,17 @@ namespace TomatoFocus.App
             // 动画结束的那一帧必须再重绘一次，否则最后一帧（含未清除的粒子/特效）会残留在屏幕上。
             // 条件里刻意**不含 running**：计时中只有"秒变化"或内容真的变了才整窗重绘；
             // 若没装备勋章，这一秒内根本不需要重绘——计时期间的重绘次数因此从 20 次/秒降到 1 次/秒。
-            if ((needFullRedraw || ambientMedal) && Visible)
+            if ((needFullRedraw || ambientMedal || ringOnly) && Visible)
             {
                 _lastPaintSecond = sec;
-                if (!needFullRedraw && !_fastRect.IsEmpty) Invalidate(_fastRect);   // 只刷勋章/光标
-                else Invalidate();                                                  // 整窗
+                if (!needFullRedraw && !_fastRect.IsEmpty) Invalidate(_fastRect);   // 只刷环/勋章/光标
+                else Invalidate();                                                  // 整窗（重建缓存）
             }
             _wasAnimating = animating;
+
+            // --paint-log：每秒一行，把"这一秒画了几次、整帧还是局部、分别是谁弄脏的"写下来。
+            // 与 --frames-log 的 frames/s 行并排看，就能分辨"泵画的"和"别人画的"。
+            if (LogPaints && now - _lastPaintLog > 1.0) LogPaintStats(now);
         }
 
         // --- 帧缓存（勋章快路径）------------------------------------------
@@ -359,6 +395,129 @@ namespace TomatoFocus.App
         private double _lastAmbientLog;
         private int _lastFast;
         private int _lastFull;
+        /// <summary>上一次见到的秒节拍（AppState.SecondBeat），用于给"逐秒文案"补帧。</summary>
+        private int _lastSecondBeat;
+
+        // --- 绘制来源统计（--paint-log）------------------------------------
+        // 只统计、不参与任何判定：关掉开关时每帧只多一次布尔判断。
+        private const int WM_PAINT_MSG = 0x000F;
+        /// <summary>最近一条非 WM_PAINT 消息：用来给随后发生的绘制归因（谁把窗口弄脏的）。</summary>
+        private int _lastMsg;
+        private int _paintCount, _fullPaintCount, _partialPaintCount;
+        private int _lastPaintCount, _lastFullPaint, _lastPartialPaint, _lastLoopTick;
+        private double _lastPaintAt = -1;
+        private double _paintGapSum, _paintGapMax;
+        private double _lastPaintLog;
+        private readonly Dictionary<int, int> _paintTriggers = new Dictionary<int, int>();
+        private readonly Dictionary<int, int> _msgCounts = new Dictionary<int, int>();
+
+        /// <summary>记录一条到达窗口的消息（含 WM_FRAME：它是最有价值的一条归因信息）。</summary>
+        private void NoteMessage(int msg)
+        {
+            _lastMsg = msg;
+            int n;
+            _msgCounts.TryGetValue(msg, out n);
+            _msgCounts[msg] = n + 1;
+        }
+
+        /// <summary>记录一次绘制：整帧还是局部、距上次多久、由哪条消息引起。</summary>
+        private void NotePaint(Rectangle clip)
+        {
+            double now = _frameClock.Elapsed.TotalSeconds;
+            bool full = clip.Width >= ClientSize.Width && clip.Height >= ClientSize.Height;
+            _paintCount++;
+            if (full) _fullPaintCount++; else _partialPaintCount++;
+            if (_lastPaintAt >= 0)
+            {
+                double gap = (now - _lastPaintAt) * 1000.0;
+                _paintGapSum += gap;
+                if (gap > _paintGapMax) _paintGapMax = gap;
+            }
+            _lastPaintAt = now;
+            int n;
+            _paintTriggers.TryGetValue(_lastMsg, out n);
+            _paintTriggers[_lastMsg] = n + 1;
+        }
+
+        /// <summary>把最近一秒的绘制来源写进日志（--paint-log）。</summary>
+        private void LogPaintStats(double now)
+        {
+            _lastPaintLog = now;
+            int n = _paintCount - _lastPaintCount;
+            int full = _fullPaintCount - _lastFullPaint;
+            int partial = _partialPaintCount - _lastPartialPaint;
+            int pumpFrames = _loopTicks - _lastLoopTick;
+            double avg = n > 1 ? _paintGapSum / (n - 1) : 0;
+            double maxGap = _paintGapMax;
+
+            _lastPaintCount = _paintCount;
+            _lastFullPaint = _fullPaintCount;
+            _lastPartialPaint = _partialPaintCount;
+            _lastLoopTick = _loopTicks;
+            _paintGapSum = 0;
+            _paintGapMax = 0;
+
+            Log.Info("paints/s: 总=" + n + " 整帧=" + full + " 局部=" + partial +
+                     " 平均间隔=" + avg.ToString("0.0") + "ms" + " 最大间隔=" + maxGap.ToString("0.0") + "ms" +
+                     " | 泵帧=" + pumpFrames + " 泵档=" + _frameInterval + "ms" +
+                     " | 触发=" + TopPairs(_paintTriggers, 4) +
+                     " | 消息=" + TopPairs(_msgCounts, 6));
+
+            _paintTriggers.Clear();
+            _msgCounts.Clear();
+        }
+
+        private static string TopPairs(Dictionary<int, int> d, int max)
+        {
+            if (d.Count == 0) return "(无)";
+            var list = new List<KeyValuePair<int, int>>(d);
+            list.Sort(delegate (KeyValuePair<int, int> a, KeyValuePair<int, int> b) { return b.Value.CompareTo(a.Value); });
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < list.Count && i < max; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(MsgName(list[i].Key)).Append("×").Append(list[i].Value);
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>把常见的窗口消息翻译成人能读的名字；其余打印十六进制。</summary>
+        private static string MsgName(int msg)
+        {
+            switch (msg)
+            {
+                case 0: return "(尚未收到消息)";
+                case WM_PAINT_MSG: return "WM_PAINT";
+                case WM_FRAME: return "WM_FRAME(泵)";
+                case 0x0003: return "WM_MOVE";
+                case 0x0005: return "WM_SIZE";
+                case 0x0006: return "WM_ACTIVATE";
+                case 0x0007: return "WM_SETFOCUS";
+                case 0x0008: return "WM_KILLFOCUS";
+                case 0x0014: return "WM_ERASEBKGND";
+                case 0x0018: return "WM_SHOWWINDOW";
+                case 0x001A: return "WM_SETTINGCHANGE";
+                case 0x001C: return "WM_ACTIVATEAPP";
+                case 0x0047: return "WM_WINDOWPOSCHANGED";
+                case 0x0080: return "WM_SETICON";
+                case 0x0084: return "WM_NCHITTEST";
+                case 0x0085: return "WM_NCPAINT";
+                case 0x0102: return "WM_CHAR";
+                case 0x0112: return "WM_SYSCOMMAND";
+                case 0x0113: return "WM_TIMER";
+                case 0x010D: return "WM_IME_STARTCOMPOSITION";
+                case 0x010F: return "WM_IME_COMPOSITION";
+                case 0x0286: return "WM_IME_CHAR";
+                case 0x0200: return "WM_MOUSEMOVE";
+                case 0x020A: return "WM_MOUSEWHEEL";
+                case 0x02E0: return "WM_DPICHANGED";
+                case 0x031A: return "WM_THEMECHANGED";
+                case 0x007E: return "WM_DISPLAYCHANGE";
+                case 0x0231: return "WM_ENTERSIZEMOVE";
+                case 0x0232: return "WM_EXITSIZEMOVE";
+                default: return "0x" + msg.ToString("X4");
+            }
+        }
 
         private bool CacheMatches()
         {
@@ -604,6 +763,7 @@ namespace TomatoFocus.App
 
             var probe = PerfProbe.Active;
             _paintClip = e.ClipRectangle;
+            if (LogPaints) NotePaint(e.ClipRectangle);   // 归因：谁把窗口弄脏的（--paint-log）
             _paintClock.Restart();
             try { DrawFrame(e.Graphics); }
             catch (Exception ex) { Log.Error("OnPaint", ex); }
@@ -614,8 +774,9 @@ namespace TomatoFocus.App
 
         /// <summary>
         /// 画一帧。
-        /// 只有勋章在变时走快路径：贴缓存位图 + 只重画那几枚勋章（因此能跑 30fps）；
-        /// 其余情况整窗重绘，并把结果存进缓存供快路径当背景。
+        /// 缓存可用且本帧没有"必须整窗"的理由时走快路径：贴上一帧缓存位图 + 只重画会动的元素
+        /// （计数环 / 勋章 / 笔记光标）。贴图由无效区裁剪，代价与脏区面积成正比；
+        /// 其余情况才整窗重绘，并把结果存进缓存供快路径当背景。
         /// </summary>
         private void DrawFrame(Graphics g)
         {
@@ -624,13 +785,16 @@ namespace TomatoFocus.App
             bool forceFull = _fullRedrawPending;
             _fullRedrawPending = false;
 
-            if (!forceFull && _medalOnlyFrame && _cacheValid && CacheMatches() && NoBufferOffset(g))
+            // 缓存可用 + 本帧没有"必须整窗"的理由 → 贴上一帧 + 只重画会动的元素。
+            // **不再要求 _medalOnlyFrame**：系统重绘、输入法光标、任何外部小区域失效也走这里，
+            // 成本按无效区面积算，而不是每次都付 10~18ms 的整窗渲染——那是卡顿的放大器。
+            if (!forceFull && _cacheValid && CacheMatches() && NoBufferOffset(g))
             {
                 try
                 {
                     _fastPathFrames++;
                     if (_fastPathFrames == 1)
-                        Log.Info("medalFastPath: 已启用 窗口=" + Left + "," + Top + " " + Width + "x" + Height +
+                        Log.Info("fastPath: 已启用 窗口=" + Left + "," + Top + " " + Width + "x" + Height +
                                  " 缓存=" + (_frameCache != null ? _frameCache.Width + "x" + _frameCache.Height : "无"));
                     long ts = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     // 贴图必须用 GDI+（DrawImageUnscaled），**不能用 BitBlt**：
@@ -643,7 +807,8 @@ namespace TomatoFocus.App
 
                     long ts2 = PerfCounters.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     _ui.DrawAmbientOverlay(g);
-                    if (_frameCacheG != null) _ui.DrawAmbientOverlay(_frameCacheG);   // 同步更新缓存
+                    _ui.DrawRingOverlay(g);
+                    if (_frameCacheG != null) { _ui.DrawAmbientOverlay(_frameCacheG); _ui.DrawRingOverlay(_frameCacheG); }   // 同步更新缓存
                     PerfCounters.Add("帧-快路径勋章", ts2);
                     PerfCounters.Add("帧-勋章快路径", ts);
                     return;
@@ -841,6 +1006,10 @@ namespace TomatoFocus.App
 
         protected override void WndProc(ref Message m)
         {
+            // 记录"上一条消息"：随后派发的 WM_PAINT 会用它归因（--paint-log 的核心）。
+            // WM_PAINT 自身不算——我们要回答的是"谁把窗口弄脏了"，不是"谁在画"。
+            if (LogPaints && m.Msg != WM_PAINT_MSG) NoteMessage(m.Msg);
+
             if (m.Msg == WM_FRAME)
             {
                 Interlocked.Exchange(ref _framePending, 0);

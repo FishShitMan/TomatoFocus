@@ -118,6 +118,7 @@ namespace TomatoFocus.Tray
             {
                 case TimerPhase.Focusing: tip = I18n.T("tray.tip.running", clock); break;
                 case TimerPhase.Paused: tip = I18n.T("tray.tip.paused", clock); break;
+                case TimerPhase.PausedBreak: tip = I18n.T("tray.tip.breakPaused", clock); break;
                 case TimerPhase.Break: tip = I18n.T("tray.tip.breaking", clock); break;
                 default: tip = I18n.T("tray.tip.idle", TomatoMath.Format(TodayTenths())); break;
             }
@@ -259,6 +260,13 @@ namespace TomatoFocus.Tray
             {
                 AddItem(menu, I18n.T("break.skip"), delegate { timer.SkipBreak(); });
             }
+            else if (app.Task != null && app.Task.Active)
+            {
+                // 任务进行中（计时器空闲的等待态）：不给"开始专注"，避免把任务轮顶掉
+                var busy = new ToolStripMenuItem(I18n.T("task.busy"));
+                busy.Enabled = false;
+                menu.Items.Add(busy);
+            }
             else
             {
                 var preset = new ToolStripMenuItem(I18n.T("menu.preset"));
@@ -272,7 +280,8 @@ namespace TomatoFocus.Tray
                 AddItem(menu, I18n.T("menu.start"), delegate
                 {
                     int m = Math.Max(1, app.Timer.PlannedSeconds / 60);
-                    app.Timer.StartFocus(m, app.Timer.Preset);
+                    string why;
+                    app.TryStartFocus(m, app.Timer.Preset, out why);
                 });
             }
 
@@ -302,7 +311,11 @@ namespace TomatoFocus.Tray
         private static ToolStripMenuItem MenuPreset(AppState app, string text, int minutes, string preset)
         {
             var item = new ToolStripMenuItem(text);
-            item.Click += delegate { app.Timer.StartFocus(minutes, preset); };
+            item.Click += delegate
+            {
+                string why;
+                app.TryStartFocus(minutes, preset, out why);   // 与主界面同一套互斥判定
+            };
             return item;
         }
 

@@ -38,6 +38,9 @@ namespace TomatoFocus
             // 每秒帧统计写日志（验证"无操作降档"用）
             if (HasFlag(args, "--frames-log")) MainForm.LogFrames = true;
 
+            // 每次绘制的来源归因写日志（定位"渲染泵之外的第二重绘源"用）
+            if (HasFlag(args, "--paint-log")) MainForm.LogPaints = true;
+
             // 快照模式：离屏渲染，不创建窗口
             string sheetDir = ArgValue(args, "--sheet");
             if (!string.IsNullOrEmpty(sheetDir))
@@ -62,7 +65,14 @@ namespace TomatoFocus
             }
 
             bool createdNew;
+            // 诊断版（编译时加 -define:TOMATO_DIAG）用独立的单实例名：
+            // 这样才能在正式版正在运行的情况下同时跑一份诊断实例。
+            // 正式编译不带该宏，永远走下面这个固定名字，单实例行为完全不变。
+#if TOMATO_DIAG
+            using (var mutex = new Mutex(true, @"Local\TomatoFocus.SingleInstance.diag", out createdNew))
+#else
             using (var mutex = new Mutex(true, @"Local\TomatoFocus.SingleInstance", out createdNew))
+#endif
             {
                 if (!createdNew)
                 {

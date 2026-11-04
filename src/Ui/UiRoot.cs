@@ -230,6 +230,69 @@ namespace TomatoFocus.Ui
         /// <summary>本帧登记到的动效勋章数量（供测试观察）。</summary>
         public int AmbientMedalCount { get { return _ambientMedals.Count; } }
 
+        // --- 计数环局部重绘（BUG 8）----------------------------------------
+        private float _ringR, _ringWid, _ringProg;
+        private Color _ringColor, _ringTrack;
+        private bool _ringValid;
+
+        /// <summary>计数环是否正处于"逐帧推进"（专注/休息进行中）。</summary>
+        public bool RingFastPath { get { return _ringValid && _ringR > 1f; } }
+
+        /// <summary>计数环的无效区（设备无关坐标，已含环宽外扩）。</summary>
+        public RectangleF RingDirtyRect
+        {
+            get
+            {
+                if (!RingFastPath) return RectangleF.Empty;
+                float r = _ringR + _ringWid * 0.5f + 4f;
+                return new RectangleF(_ringCenter.X - r, _ringCenter.Y - r, r * 2f, r * 2f);
+            }
+        }
+
+        /// <summary>快路径重画计数环：先用轨道覆盖掉上一帧的弧，再按**当前**进度画新弧。</summary>
+        public void DrawRingOverlay(Graphics g)
+        {
+            if (!RingFastPath) return;
+            // 进度必须现取：_ringProg 是上一帧整窗绘制时的快照，用它画弧等于每帧重复同一段，
+            // 环形动效看着还是"一秒一跳"。几何（圆心/半径/线宽/配色）仍用整窗帧登记的缓存。
+            float prog = (float)_app.Timer.Progress;
+            if (prog < 0f) prog = 0f;
+            if (prog > 1f) prog = 1f;
+            var pt = new Painter(g, Scale, _app.CurrentTheme);
+            pt.StrokeCircle(_ringCenter, _ringR, _ringTrack, _ringWid);
+            if (prog > 0.001f)
+                pt.Arc(_ringCenter, _ringR, -90f, 360f * prog, _ringColor, _ringWid);
+        }
+
+        /// <summary>
+        /// 是否处于"只有计数环在推进"的状态（没装备勋章也能走局部重绘）。
+        /// 环形几何由整窗帧登记（_ringValid），所以只要计时在跑、且没有被弹层遮挡就可以。
+        /// </summary>
+        public bool CanDrawRingOnly
+        {
+            get
+            {
+                if (!RingFastPath) return false;
+                if (!OverlayFree) return false;
+                return true;
+            }
+        }
+
+        /// <summary>当前没有被"整窗级"的弹层遮挡（调试面板 / 结束确认条 / 提醒卡 / 问候卡 / 提示条 / 任务中断弹窗）。</summary>
+        private bool OverlayFree
+        {
+            get
+            {
+                if (_debugOpen || _confirmStop) return false;
+                if (_app.Pending != null) return false;
+                if (_app.PendingGreeting != null) return false;   // 问候卡在动：需要整窗重绘
+                if (_toastT > 0) return false;
+                var st = _app.Data.CurrentTask;
+                if (st != null && st.Status == TaskState.StatusInterrupted) return false;   // 模态卡盖住环
+                return true;
+            }
+        }
+
         /// <summary>
         /// 是否处于"只有勋章（可选：笔记光标）在变"的状态。
         /// 满足时外壳可以走快路径：贴上上一帧的缓存位图 + 只重画这些元素，
@@ -241,10 +304,7 @@ namespace TomatoFocus.Ui
             get
             {
                 if (_ambientMedals.Count == 0) return false;
-                if (_debugOpen || _confirmStop) return false;
-                if (_app.Pending != null) return false;
-                if (_app.PendingGreeting != null) return false;   // 问候卡在动：需要整窗重绘
-                if (_toastT > 0) return false;
+                if (!OverlayFree) return false;
                 // 笔记聚焦不再排除：光标已改为独立细条，快路径会连它一起擦/画
                 return true;
             }
@@ -721,7 +781,13 @@ namespace TomatoFocus.Ui
             switch (_app.Timer.Phase)
             {
                 case TimerPhase.Focusing: _app.Timer.Pause(); break;
-                case TimerPhase.Paused: _app.Timer.Resume(); break;
+                case TimerPhase.Paused:
+                    // 任务的目标程序没在跑时，不允许凭「继续」把这一轮跑起来
+                    // （否则会一边计时一边对着不存在的程序记专注）
+                    if (!AllowResumeTask()) return;
+                    _app.Timer.Resume();
+                    break;
+                case TimerPhase.PausedBreak: _app.Timer.Resume(); break;   // 继续休息
                 case TimerPhase.Break: _app.Timer.SkipBreak(); break;
                 default:
                     // 自定输入中：有效数值则直接开始倒计时；尚未输入或无效则什么都不做
@@ -732,17 +798,53 @@ namespace TomatoFocus.Ui
             _dirty = true;
         }
 
+        /// <summary>
+        /// 能否点「继续」：任务处于"程序已退出"且目标进程确实不在时禁止，
+        /// 并顺手触发一次重新检测（提示与手动刷新体验一致）。
+        /// </summary>
+        private bool AllowResumeTask()
+        {
+            var task = _app.Data.CurrentTask;
+            if (task == null || task.Status != TaskState.StatusProgramGone) return true;
+            if (_app.Task != null && _app.Task.ProgramAlive) return true;
+
+            if (_app.Task != null) _app.Task.Recheck();
+            if (_app.Task != null && _app.Task.ProgramAlive) return true;
+
+            ShowToast(I18n.T("task.resume.needProgram"));
+            _dirty = true;
+            return false;
+        }
+
         /// <summary>按当前档位开始（不改档位）。</summary>
         private void StartNow()
         {
+            // 互斥统一走 AppState.TryStartFocus：计时器忙 / 任务进行中都会被拒，
+            // 且与托盘菜单用同一套判定，不会再出现"某个入口没拦住"。
             if (_mode == "break")
             {
+                if (_app.Data.CurrentTask != null && _app.Data.CurrentTask.IsActive)
+                {
+                    ShowToast(I18n.T("task.busy"));
+                    return;
+                }
+                if (_app.Timer.Phase != TimerPhase.Idle)
+                {
+                    ShowToast(I18n.T("focus.busy"));
+                    return;
+                }
                 _app.Timer.StartBreak(Math.Max(1, _breakPresetMinutes) * 60);
                 return;
             }
+
             int m = _app.Timer.PlannedSeconds / 60;
             if (m <= 0) m = 5;                 // 兜底：默认最低档
-            _app.Timer.StartFocus(m, _app.Timer.Preset);
+            string blockKey;
+            if (!_app.TryStartFocus(m, _app.Timer.Preset, out blockKey))
+            {
+                ShowToast(I18n.T(blockKey));
+                return;
+            }
             _app.RememberPreset();
         }
 
@@ -1224,6 +1326,7 @@ namespace TomatoFocus.Ui
             bool focusing = timer.Phase == TimerPhase.Focusing;
             bool paused = timer.Phase == TimerPhase.Paused;
             bool breaking = timer.Phase == TimerPhase.Break;
+            bool pausedBreak = timer.Phase == TimerPhase.PausedBreak;   // 休息被暂停（休眠/崩溃恢复）
             bool hideClock = _app.Data.Settings.HideCountdown;
 
             // 自定输入过程中，让时间环跟随输入的数字实时变化（只影响预览，不改真实状态）
@@ -1240,7 +1343,7 @@ namespace TomatoFocus.Ui
 
             // 计时进行中，模式自动跟随实际状态
             if (timer.Phase == TimerPhase.Focusing || timer.Phase == TimerPhase.Paused) _mode = "focus";
-            else if (timer.Phase == TimerPhase.Break) _mode = "break";
+            else if (timer.Phase == TimerPhase.Break || timer.Phase == TimerPhase.PausedBreak) _mode = "break";
 
             // 模式配色的渐变进度：与胶囊滑块共用同一个动画值
             var modeAnim = A("mode", 0f, 16f);
@@ -1256,9 +1359,18 @@ namespace TomatoFocus.Ui
 
             // 进度
             float progress = timer.Phase == TimerPhase.Idle ? 0f : (float)timer.Progress;
-            Color arcColor = paused ? t.Warn : Tint(t.Accent);
+            Color arcColor = (paused || pausedBreak) ? t.Warn : Tint(t.Accent);
             if (progress > 0.001f)
                 pt.Arc(_ringCenter, radius, -90f, 360f * progress, arcColor, ringW);
+
+            // 记录本帧的环参数：运行中外壳只重画这一小块（局部无效区），
+            // 既能把弧线推到 30fps，又不用每帧整窗重绘（省电）。
+            _ringR = radius;
+            _ringWid = ringW;
+            _ringProg = progress;
+            _ringColor = arcColor;
+            _ringTrack = t.RingTrack;
+            _ringValid = timer.Phase == TimerPhase.Focusing || timer.Phase == TimerPhase.Break;
 
             // 完成脉冲光环
             if (_celebrate.Playing)
@@ -1268,16 +1380,28 @@ namespace TomatoFocus.Ui
             }
 
             // 状态文字
-            string status = breaking ? I18n.T("focus.breaking")
+            string status = pausedBreak ? I18n.T("break.paused")
+                : breaking ? I18n.T("focus.breaking")
                 : focusing ? I18n.T("focus.focusing")
                 : paused ? I18n.T("focus.paused")
                 : I18n.T("focus.idle");
-            Color statusColor = breaking ? t.Leaf : (paused ? t.Warn : t.TextMuted);
+            Color statusColor = (breaking && !pausedBreak) ? t.Leaf : ((paused || pausedBreak) ? t.Warn : t.TextMuted);
 
             if (!hideClock)
             {
-                var clockFont = pt.F(Math.Max(30f, radius * 0.52f), true, Painter.MonoFamily);
-                pt.TextCenterBaseline(TomatoMath.FormatClock(displaySeconds), clockFont, t.Text,
+                // 字号按"本模式下最长可能字符串"一次定死，不让它随秒数变化：
+                // ① 超过 1 小时显示 h:mm:ss 时会溢出环外（BUG 5）；
+                // ② mm:ss → h:mm:ss 切换时字宽突变，画面像在跳动（BUG 6）。
+                string clockText = TomatoMath.FormatClock(displaySeconds);
+                bool longForm = Math.Max(displaySeconds, previewMinutes * 60) >= 3600;
+                string widest = longForm ? "88:88:88" : "88:88";
+                float basePx = Math.Max(30f, radius * 0.52f);
+                float maxW = radius * 1.56f;                       // 环内可用宽度（避开环宽）
+                float probe = pt.TextWidth(widest, pt.F(basePx, true, Painter.MonoFamily));
+                float px = probe > maxW ? basePx * (maxW / probe) : basePx;
+                if (px < 16f) px = 16f;
+                var clockFont = pt.F(px, true, Painter.MonoFamily);
+                pt.TextCenterBaseline(clockText, clockFont, t.Text,
                     new RectangleF(_ringCenter.X - radius, _ringCenter.Y - radius * 0.42f, radius * 2, radius * 0.84f));
                 pt.TextCenter(status, pt.F(Math.Max(12f, radius * 0.135f), true), statusColor,
                     new RectangleF(_ringCenter.X - radius, _ringCenter.Y + radius * 0.30f, radius * 2, 24));
@@ -1311,7 +1435,7 @@ namespace TomatoFocus.Ui
             // 状态切换时播放「水滴分裂/合并」动效
             if (!_confirmStop)
             {
-                bool showStop = focusing || paused;
+                bool showStop = focusing || paused || pausedBreak;
                 float gap = 12f;
                 float btnW = 140f;
                 float pairW = btnW * 2f + gap;
@@ -1334,7 +1458,8 @@ namespace TomatoFocus.Ui
 
                 var primary = new RectangleF(pairLeft, btnTop, primaryW, btnH);
 
-                string primaryLabel = breaking ? I18n.T("break.skip")
+                string primaryLabel = pausedBreak ? I18n.T("break.resume")
+                    : breaking ? I18n.T("break.skip")
                     : focusing ? I18n.T("focus.pause")
                     : paused ? I18n.T("focus.resume")
                     : I18n.T("focus.start");
@@ -1344,12 +1469,22 @@ namespace TomatoFocus.Ui
                 if (secondaryW > 1.5f)
                 {
                     var secondary = new RectangleF(pairLeft + pairW - secondaryW, btnTop, secondaryW, btnH);
-                    DrawGhostButton(pt, "btnStop", secondary, I18n.T("focus.stop"), "stop", delegate
+                    if (pausedBreak)
                     {
-                        BeginDrawerClose();
-                        _confirmStop = true;
-                        _dirty = true;
-                    }, showStop);
+                        // 暂停的休息：主按钮"继续休息"，次按钮直接"跳过休息"
+                        // （不能走"结束本轮"确认条——那会把休息当专注结算，凭空记一笔）
+                        DrawGhostButton(pt, "btnStop", secondary, I18n.T("break.skip"), "stop",
+                            delegate { _app.Timer.SkipBreak(); _dirty = true; }, showStop);
+                    }
+                    else
+                    {
+                        DrawGhostButton(pt, "btnStop", secondary, I18n.T("focus.stop"), "stop", delegate
+                        {
+                            BeginDrawerClose();
+                            _confirmStop = true;
+                            _dirty = true;
+                        }, showStop);
+                    }
 
                     // 接缝处的水滴：随分裂进度缩放并渐隐
                     if (split > 0.02f && split < 0.98f)

@@ -95,13 +95,17 @@ namespace TomatoFocus.Ui
                 pt.TextLeft(I18n.T("task.setup.grabHint"), pt.F(9.5f), t.TextMuted, new RectangleF(x, y - 2, w, 16));
 
             var start = new RectangleF(x, card.Bottom - 46, 118, 34);
-            bool canStart = !string.IsNullOrEmpty(cfg.ProcessName);
+            bool timerBusy = _app.Timer.Phase != TimerPhase.Idle;
+            bool canStart = !string.IsNullOrEmpty(cfg.ProcessName) && !timerBusy;
             pt.FillRound(start, 17f, canStart ? t.Accent : Theme.Alpha(t.Accent, 110));
             pt.TextCenter(I18n.T("task.setup.start"), pt.F(12f, true), Color.White, start);
             Hot("taskStart", start, delegate
             {
-                if (!canStart) { ShowToast(I18n.T("task.setup.needProgram")); return; }
-                if (_app.Task.Start()) { _taskSetup = false; _dirty = true; }
+                // 前置校验全部交给 TaskRunner.Start()：计时器忙 / 已有任务 / 目标程序没在跑
+                // 都会返回具体原因，这里只负责把它弹出来。
+                if (_app.Task.Start()) { _taskSetup = false; _dirty = true; return; }
+                string key = string.IsNullOrEmpty(_app.Task.LastStartError) ? "task.busy" : _app.Task.LastStartError;
+                ShowToast(I18n.T(key));
             });
 
             var cancel = new RectangleF(start.Right + 10, card.Bottom - 46, 80, 34);
@@ -148,6 +152,8 @@ namespace TomatoFocus.Ui
 
             bool gone = st.Status == TaskState.StatusProgramGone;
             bool away = st.Status == TaskState.StatusAway;
+            // 目标程序是否还在跑：由 TaskRunner 每秒采样一次并缓存，绘制里绝不枚举进程
+            bool progAlive = _app.Task.ProgramAlive;
 
             pt.TextLeft(I18n.T("task.title"), pt.F(12.5f, true), t.TextMuted, new RectangleF(x, y, 46, 22));
             pt.TextLeft(st.ProcessName, pt.F(12f, true), t.Text, new RectangleF(x + 42, y, w - 42 - 96, 22));
@@ -156,7 +162,8 @@ namespace TomatoFocus.Ui
             var phaseNow = _app.Timer.Phase;
             string stateText;
             Color stateColor;
-            if (gone) { stateText = I18n.T("task.state.gone"); stateColor = t.Warn; }
+            if (gone && progAlive) { stateText = I18n.T("task.state.back"); stateColor = t.Good; }
+            else if (gone) { stateText = I18n.T("task.state.gone"); stateColor = t.Warn; }
             else if (away) { stateText = I18n.T("task.state.away"); stateColor = t.Warn; }
             else if (phaseNow == TimerPhase.Paused) { stateText = I18n.T("focus.paused"); stateColor = t.Warn; }
             else if (phaseNow == TimerPhase.Break) { stateText = I18n.T("focus.breaking"); stateColor = t.AccentDark; }
@@ -178,32 +185,65 @@ namespace TomatoFocus.Ui
             y += 16;
 
             string info;
-            if (gone) info = I18n.T("task.wait.programGone");
+            Color infoColor = t.TextMuted;
+            if (gone)
+            {
+                info = I18n.T(progAlive ? "task.wait.programBack" : "task.wait.programGone");
+                if (!progAlive) infoColor = t.Warn;
+            }
             else if (away)
             {
-                int left = Math.Max(0, TaskRunner.AwayGraceSeconds - st.ContinuousAwaySec);
-                info = I18n.T("task.away", st.ContinuousAwaySec) + "  " + I18n.T("task.away.left", left);
+                if (st.ContinuousAwaySec >= TaskRunner.AwayGraceSeconds)
+                    info = I18n.T("task.away.paused", st.ContinuousAwaySec);   // 已经自动暂停，别再显示"还剩 0 秒"
+                else
+                {
+                    int left = Math.Max(0, TaskRunner.AwayGraceSeconds - st.ContinuousAwaySec);
+                    info = I18n.T("task.away", st.ContinuousAwaySec) + "  " + I18n.T("task.away.left", left);
+                }
+                infoColor = t.Warn;
             }
             else info = I18n.T("task.round", st.RoundIndex, st.RoundsTotal);
-            pt.TextLeft(info, pt.F(10.5f), (gone || away) ? t.Warn : t.TextMuted,
-                new RectangleF(x, y, w, 16));
+            pt.TextLeft(info, pt.F(10.5f), infoColor, new RectangleF(x, y, w, 16));
             y += 22;
 
             // 专注/休息时主界面已有「暂停 / 结束本轮」，卡片内不再重复按钮（图一）。
-            // 只有"已偏离""程序已退出"这两种主界面表达不了的状态，才在卡片内给动作。
+            // 只有"已偏离""程序已退出""程序已回来"这几种主界面表达不了的状态，才在卡片内给动作。
             if (gone || away)
             {
                 bool canEarly = _app.Task.CanClaimEarly;
                 var b1 = new RectangleF(x, y, 108, 34);
                 var b2 = new RectangleF(x + 118, y, 76, 34);
-                DrawTaskButton(pt, t, b1, I18n.T("task.claimEarly"), canEarly, "taskClaimEarly",
-                    delegate { if (canEarly) _app.Task.ClaimEarly(); });
+                var b3 = new RectangleF(x + 204, y, 76, 34);
+
                 if (away)
+                {
+                    DrawTaskButton(pt, t, b1, I18n.T("task.claimEarly"), canEarly, "taskClaimEarly",
+                        delegate { if (canEarly) _app.Task.ClaimEarly(); });
                     DrawTaskButton(pt, t, b2, I18n.T("task.resume"), true, "taskResume",
                         delegate { _app.Task.ResumeFromAway(); });
-                else
+                }
+                else if (progAlive)
+                {
+                    // 程序已经回来了：给「继续」，由用户决定什么时候接着走（不自动抢跑）
+                    DrawTaskButton(pt, t, b1, I18n.T("task.continue"), true, "taskContinue",
+                        delegate { _app.Task.ResumeFromGone(); });
                     DrawTaskButton(pt, t, b2, I18n.T("task.end"), true, "taskEnd",
                         delegate { BeginTaskEnd(); });
+                }
+                else
+                {
+                    DrawTaskButton(pt, t, b1, I18n.T("task.claimEarly"), canEarly, "taskClaimEarly",
+                        delegate { if (canEarly) _app.Task.ClaimEarly(); });
+                    DrawTaskButton(pt, t, b2, I18n.T("task.end"), true, "taskEnd",
+                        delegate { BeginTaskEnd(); });
+                }
+
+                // 手动刷新：任何"程序已退出 / 已回来"的状态都必须能自己重新检测一次
+                DrawTaskButton(pt, t, b3, I18n.T("task.recheck"), true, "taskRecheck", delegate
+                {
+                    bool alive = _app.Task.Recheck();
+                    ShowToast(I18n.T(alive ? "task.recheck.ok" : "task.recheck.fail"));
+                });
             }
         }
 
@@ -280,6 +320,23 @@ namespace TomatoFocus.Ui
             _dirty = true;
         }
 
+        /// <summary>
+        /// 「异常中断」弹窗的按钮行与提示文字布局（绘制与测试共用，避免再出现"文字压按钮"）。
+        /// 返回：[0]=继续任务 [1]=结束任务 [2]=提示文字（宽度不足时为空矩形，不绘制）。
+        /// 提示**必须**落在按钮右侧：早期把它放在按钮行内部，右对齐后正好盖住「结束任务」，
+        /// 屏幕上糊成「结束任务·半收益结算」。
+        /// </summary>
+        internal static RectangleF[] InterruptLayout(RectangleF card)
+        {
+            float by = card.Bottom - 56;
+            var cont = new RectangleF(card.Left + 24, by, 118, 38);
+            var end = new RectangleF(cont.Right + 10, by, 96, 38);
+            float hx = end.Right + 12;
+            float hw = card.Right - 24 - hx;
+            var hint = hw > 24f ? new RectangleF(hx, by + 10, hw, 18) : RectangleF.Empty;
+            return new[] { cont, end, hint };
+        }
+
         /// <summary>「任务被异常中断，是否继续？」弹窗（目标程序崩溃 / 程序自身崩溃后首启）。</summary>
         private void DrawTaskInterrupted(Painter pt)
         {
@@ -294,6 +351,10 @@ namespace TomatoFocus.Ui
 
             using (var dim = new SolidBrush(Theme.Alpha(Color.Black, 90)))
                 pt.Raw.FillRectangle(dim, 0, 0, b.Width, b.Height);
+
+            // 整窗屏障：热区"后注册者优先"，这一条必须紧跟遮罩注册，
+            // 否则弹窗下方的休息卡、日历格子、日详情抽屉都还能被点中。
+            Hot("taskInterruptBackdrop", new RectangleF(0, 0, b.Width, b.Height), null);
 
             pt.Shadow(card, 20f, 12f, t.Shadow);
             pt.FillRound(card, 20f, t.Surface);
@@ -329,19 +390,21 @@ namespace TomatoFocus.Ui
                         new RectangleF(card.Left + 24, card.Top + 84, w - 48, 18));
             }
 
-            float by = card.Bottom - 56;
-            var cont = new RectangleF(card.Left + 24, by, 118, 38);
+            var layout = InterruptLayout(card);
+            var cont = layout[0];
+            var end = layout[1];
+            var hint = layout[2];
+
             pt.FillRound(cont, 19f, t.Accent);
             pt.TextCenter(I18n.T("task.interrupt.cont"), pt.F(12f, true), Color.White, cont);
             Hot("taskInterruptCont", cont, delegate { task.ContinueFromInterrupted(); _dirty = true; });
 
-            var end = new RectangleF(cont.Right + 10, by, 96, 38);
             pt.FillRound(end, 19f, t.SurfaceAlt);
             pt.TextCenter(I18n.T("task.interrupt.end"), pt.F(12f, true), t.TextMuted, end);
             Hot("taskInterruptEnd", end, delegate { task.EndFromInterrupted(); _dirty = true; });
 
-            pt.TextRight(I18n.T("task.interrupt.hint"), pt.F(9.5f), t.TextMuted,
-                new RectangleF(card.Left + 24, by + 10, w - 268, 18));
+            if (hint.Width > 24f)
+                pt.TextLeft(I18n.T("task.interrupt.hint"), pt.F(9.5f), t.TextMuted, hint);
         }
     }
 }

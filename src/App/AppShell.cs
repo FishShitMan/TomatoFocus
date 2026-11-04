@@ -27,6 +27,14 @@ namespace TomatoFocus.App
             _app.Load();
             if (!System.IO.File.Exists(AppPaths.DataFile)) _app.Save();   // 首次运行即建立数据文件
 
+            // 崩溃恢复：只恢复成"暂停"（专注暂停 / 休息暂停），绝不自动续跑。
+            // 提示留到窗口或托盘就绪之后再弹（见文件末尾 NotifyRecovered）。
+            bool recovered = _app.TryRecoverSession();
+
+            // 没恢复出任何计时、但任务还活着 → 转"待用户决定"（弹中断弹窗），
+            // 否则会留下"任务卡在、左边是全新准备开始"的僵局。
+            if (!recovered) _app.MarkTaskNeedsAttention();
+
             _app.Timer.BreakCompleted += OnBreakCompleted;
             _app.Timer.Suspended += OnSuspended;
             _app.Timer.StateChanged += OnStateChanged;
@@ -69,6 +77,9 @@ namespace TomatoFocus.App
 
             Log.Info("shell startMinimized=" + startMinimized + " minimal=" + _app.Data.Settings.MinimalMode +
                      " visible=" + _form.Visible + " handle=" + _form.IsHandleCreated);
+
+            // 恢复提示：与"休眠挂起自动暂停"同一条通道，用户只看到一种"上次没跑完"
+            if (recovered) NotifyRecovered();
 
             // 兜底：启动后 250ms 再确认一次隐藏状态
             if (hiddenStart)
@@ -212,10 +223,29 @@ namespace TomatoFocus.App
             return fallback;
         }
 
+        /// <summary>
+        /// 崩溃恢复后的提示：与"休眠挂起自动暂停"共用同一套暂停状态与提示通道，
+        /// 用户看到的始终是"上次没跑完、已经暂停在这儿"。
+        /// </summary>
+        private void NotifyRecovered()
+        {
+            try
+            {
+                string clock = TomatoMath.FormatClock(_app.Timer.RemainingSeconds);
+                string key = _app.Timer.Phase == TimerPhase.PausedBreak ? "focus.recovered.break" : "focus.recovered";
+                string msg = I18n.T(key, clock);
+                if (_form != null && _form.Visible) _form.Ui.ShowToast(msg);
+                else _tray.ShowBalloon(I18n.T("app.title"), msg);
+            }
+            catch (Exception ex) { Log.Error("NotifyRecovered", ex); }
+        }
+
         private void OnSuspended(object sender, EventArgs e)
         {
-            _app.ShowToast(I18n.T("focus.paused"));
-            if (!_form.Visible) _tray.ShowBalloon(I18n.T("app.title"), I18n.T("focus.paused"));
+            // 休息被挂起也算"暂停"，文案跟着阶段走
+            string msg = _app.Timer.Phase == TimerPhase.PausedBreak ? I18n.T("break.paused") : I18n.T("focus.paused");
+            _app.ShowToast(msg);
+            if (!_form.Visible) _tray.ShowBalloon(I18n.T("app.title"), msg);
         }
 
         private void OnToast(object sender, string message)
