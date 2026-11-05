@@ -90,6 +90,7 @@ namespace TomatoFocus.Tests
                 TestTaskSystem();
                 TestSessionRecovery();
                 TestTaskStateGuards();
+                TestOverlayAndDayPaging();
                 TestBugFixesBatch1();
             }
             catch (Exception ex)
@@ -1288,7 +1289,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.6.1");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.6.2");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -3232,6 +3233,88 @@ namespace TomatoFocus.Tests
             True("初始 ProgramAlive 为真", fresh.Task.ProgramAlive);
 
             Journal.Clear();
+        }
+
+        /// <summary>弹层遮罩与日详情翻页。</summary>
+        private static void TestOverlayAndDayPaging()
+        {
+            Group("遮罩与日翻页");
+
+            // ① 日翻页：只在"有记录的日子"之间跳
+            var keys = new[] { "2026-11-01", "2026-11-03", "2026-11-05" };
+            Eq("往前翻到上一条记录", UiRoot.ShiftRecordedDay(keys, "2026-11-03", -1), "2026-11-01");
+            Eq("往后翻到下一条记录", UiRoot.ShiftRecordedDay(keys, "2026-11-03", 1), "2026-11-05");
+            True("没有更早的记录", UiRoot.ShiftRecordedDay(keys, "2026-11-01", -1) == null);
+            True("没有更晚的记录", UiRoot.ShiftRecordedDay(keys, "2026-11-05", 1) == null);
+
+            // ② 抽屉打开时禁止"只刷环"：否则环会亮在遮罩之上，每帧闪一下
+            var app = new AppState();
+            app.Data = new AppData();
+            app.Timer.StartFocus(25, "25");
+            var ui = new UiRoot(app) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+            using (var bmp = new Bitmap(1040, 700)) using (var g = Graphics.FromImage(bmp)) ui.Draw(g);
+            True("计时中可只刷环", ui.CanDrawRingOnly);
+            ui.OpenDrawerForTest("menu");
+            using (var bmp = new Bitmap(1040, 700)) using (var g = Graphics.FromImage(bmp)) ui.Draw(g);
+            True("抽屉打开时禁止只刷环", !ui.CanDrawRingOnly);
+
+            // ③ 提醒卡：点它后面不该生效（屏障挡在档位之前）
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            app2.Pending = new Reminder();
+            var ui2 = new UiRoot(app2) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+            for (int i = 0; i < 40; i++)
+            {
+                using (var bmp = new Bitmap(1040, 700)) using (var g = Graphics.FromImage(bmp)) ui2.Draw(g);
+                ui2.Update(1.0 / 30.0);
+            }
+            var hots2 = new List<Hotspot>(ui2.Hotspots);
+            var chip = FindHot(hots2, "preset5");
+            var back = FindHot(hots2, "reminderBackdrop");
+            True("提醒卡已注册整窗屏障", back != null);
+            True("档位热区仍在", chip != null);
+            if (chip != null)
+            {
+                var c = new PointF(chip.Rect.Left + chip.Rect.Width / 2f, chip.Rect.Top + chip.Rect.Height / 2f);
+                Eq("屏障后面的档位点不到", HitId(hots2, c), "reminderBackdrop");
+            }
+
+            // ④ 日详情抽屉：给出上一页 / 下一页按钮，已是最后一天时下一页置灰
+            var app3 = new AppState();
+            app3.Data = new AppData();
+            app3.Data.Days["2026-11-04"] = new DayStat();
+            app3.Data.Days["2026-11-05"] = new DayStat();
+            var ui3 = new UiRoot(app3) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+            ui3.OpenDayForTest("2026-11-05");
+            for (int i = 0; i < 40; i++)
+            {
+                using (var bmp = new Bitmap(1040, 700)) using (var g = Graphics.FromImage(bmp)) ui3.Draw(g);
+                ui3.Update(1.0 / 30.0);
+            }
+            var hots3 = new List<Hotspot>(ui3.Hotspots);
+            var prev = FindHot(hots3, "dayPrev");
+            var next = FindHot(hots3, "dayNext");
+            True("有「上一页」且可点", prev != null && prev.Click != null);
+            True("已是最后一天，「下一页」置灰", next != null && next.Click == null);
+        }
+
+        private static Hotspot FindHot(List<Hotspot> hots, string id)
+        {
+            if (hots == null) return null;
+            for (int i = 0; i < hots.Count; i++) if (hots[i].Id == id) return hots[i];
+            return null;
+        }
+
+        /// <summary>复刻界面的命中规则：后注册者优先。</summary>
+        private static string HitId(List<Hotspot> hots, PointF p)
+        {
+            for (int i = hots.Count - 1; i >= 0; i--)
+            {
+                var h = hots[i];
+                if (!h.Enabled) continue;
+                if (h.Rect.Contains(p)) return h.Id;
+            }
+            return "";
         }
 
         /// <summary>第一批 BUG 回归：时钟长形态、确认条遮挡热区。</summary>

@@ -392,6 +392,47 @@ namespace TomatoFocus.Ui
         }
 
         // --- 抽屉 ----------------------------------------------------------
+        /// <summary>
+        /// 在"有记录的日子"里按日期前后翻一页。
+        /// keys 形如 <c>yyyy-MM-dd</c>，字典序即时间序；找不到更早 / 更晚的记录时返回 null。
+        /// </summary>
+        internal static string ShiftRecordedDay(IEnumerable<string> keys, string from, int dir)
+        {
+            if (keys == null || string.IsNullOrEmpty(from) || dir == 0) return null;
+            string best = null;
+            foreach (string k in keys)
+            {
+                if (string.IsNullOrEmpty(k)) continue;
+                int cmp = string.CompareOrdinal(k, from);
+                if (dir < 0)
+                {
+                    if (cmp >= 0) continue;
+                    if (best == null || string.CompareOrdinal(k, best) > 0) best = k;
+                }
+                else
+                {
+                    if (cmp <= 0) continue;
+                    if (best == null || string.CompareOrdinal(k, best) < 0) best = k;
+                }
+            }
+            return best;
+        }
+
+        private string RecordedDayNear(string from, int dir)
+        {
+            return ShiftRecordedDay(new List<string>(_app.Data.Days.Keys), from, dir);
+        }
+
+        /// <summary>日详情翻到指定日期：滚动位置归零，并取消未完成的滚动补间。</summary>
+        private void GoDay(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+            _dayKey = key;
+            _drawerScroll = 0f;
+            _scrollTarget = -1f;
+            _dirty = true;
+        }
+
         private void DrawDrawer(Painter pt)
         {
             float k = A("drawer").Value;
@@ -436,9 +477,24 @@ namespace TomatoFocus.Ui
                 : kind == "day" ? I18n.T("cal.dayDetail", DayKey.Parse(dayKey).Month, DayKey.Parse(dayKey).Day)
                 : "";
 
-            pt.TextLeft(title, pt.F(17f, true), t.Text, new RectangleF(inner.Left, inner.Top, inner.Width - 40, 30));
+            pt.TextLeft(title, pt.F(17f, true), t.Text,
+                new RectangleF(inner.Left, inner.Top, inner.Width - (kind == "day" ? 116 : 40), 30));
             DrawIconButton(pt, "drawerClose", new RectangleF(inner.Right - 32, inner.Top, 32, 30), "close", false,
                 delegate { BeginDrawerClose(); });
+
+            // 日详情：标题右侧给"上一条 / 下一条有记录的日"翻页按钮（没有更早/更晚的记录时置灰）
+            if (kind == "day")
+            {
+                string prevKey = RecordedDayNear(dayKey, -1);
+                string nextKey = RecordedDayNear(dayKey, +1);
+                var nextRect = new RectangleF(inner.Right - 68, inner.Top, 30, 30);
+                var prevRect = new RectangleF(inner.Right - 104, inner.Top, 30, 30);
+                string pk = prevKey, nk = nextKey;
+                DrawIconButton(pt, "dayPrev", prevRect, "chevronLeft", false,
+                    pk == null ? null : (Action)delegate { GoDay(pk); }, pk != null);
+                DrawIconButton(pt, "dayNext", nextRect, "chevronRight", false,
+                    nk == null ? null : (Action)delegate { GoDay(nk); }, nk != null);
+            }
 
             // 菜单抽屉：顶部三段式切换（成就 / 奖励 / 设置）
             float contentTop = inner.Top + 42;
@@ -1020,6 +1076,10 @@ namespace TomatoFocus.Ui
             float h = taskBreak ? 214f : 176f;
             var card = new RectangleF(b.Width / 2f - w / 2f, b.Height - h - 28 - (1 - k) * 24, w, h);
 
+            // 整窗屏障：这张卡片长得就是"要先处理它"的样子，点它后面不该生效
+            // （顶栏保持可用，与抽屉的遮罩口径一致）。卡片自己的按钮在下面注册，后注册者优先。
+            Hot("reminderBackdrop", new RectangleF(0, 60, b.Width, Math.Max(0, b.Height - 60)), null);
+
             pt.Shadow(card, 20f, 12f, t.Shadow);
             pt.FillRound(card, 20f, t.Surface);
             pt.StrokeRound(card, 20f, Theme.Alpha(t.Accent, 70), 1.2f);
@@ -1232,7 +1292,9 @@ namespace TomatoFocus.Ui
             float a = (float)Math.Min(1.0, _toastT / 0.6);
             pt.Shadow(r, 20f, 8f, Theme.Alpha(Color.Black, (int)(40 * a)));
             pt.FillRound(r, 20f, Theme.Alpha(t.Text, (int)(230 * a)));
-            pt.TextCenter(_toast, font, Theme.Alpha(Color.White, (int)(255 * a)), r);
+            // 气泡底色是"文字色"（深色主题下接近纯白），文字必须用背景色才能拉开对比；
+            // 之前固定写 Color.White，深色主题下就是白底白字。
+            pt.TextCenter(_toast, font, Theme.Alpha(t.Bg, (int)(255 * a)), r);
         }
 
         private void DrawParticles(Painter pt)

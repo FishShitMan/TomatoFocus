@@ -253,6 +253,9 @@ namespace TomatoFocus.Ui
         public void DrawRingOverlay(Graphics g)
         {
             if (!RingFastPath) return;
+            // 抽屉压着半透明遮罩时不要再叠环：环会被画在遮罩之上、比周围亮一大截，
+            // 而且每帧补一次，观感就是"环在闪"。等抽屉关掉（整窗重绘）自然会追上进度。
+            if (DrawerDimming) return;
             // 进度必须现取：_ringProg 是上一帧整窗绘制时的快照，用它画弧等于每帧重复同一段，
             // 环形动效看着还是"一秒一跳"。几何（圆心/半径/线宽/配色）仍用整窗帧登记的缓存。
             float prog = (float)_app.Timer.Progress;
@@ -273,6 +276,7 @@ namespace TomatoFocus.Ui
             get
             {
                 if (!RingFastPath) return false;
+                if (DrawerDimming) return false;   // 遮罩压暗了左半边，环不该单独重画
                 if (!OverlayFree) return false;
                 return true;
             }
@@ -292,6 +296,9 @@ namespace TomatoFocus.Ui
                 return true;
             }
         }
+
+        /// <summary>抽屉（含收起动画）是否正压着半透明遮罩。</summary>
+        private bool DrawerDimming { get { return !string.IsNullOrEmpty(_drawer) || !string.IsNullOrEmpty(_closingDrawer); } }
 
         /// <summary>
         /// 是否处于"只有勋章（可选：笔记光标）在变"的状态。
@@ -352,6 +359,21 @@ namespace TomatoFocus.Ui
 
         /// <summary>休息模式当前选中的分钟数。</summary>
         public int BreakPresetMinutes { get { return _breakPresetMinutes; } }
+
+        /// <summary>测试 / 诊断用：不经过点击直接打开某个抽屉（menu / day 等）。</summary>
+        internal void OpenDrawerForTest(string kind)
+        {
+            _drawer = kind ?? "";
+            _closingDrawer = "";
+            _dirty = true;
+        }
+
+        /// <summary>测试 / 诊断用：打开某一天的日详情抽屉。</summary>
+        internal void OpenDayForTest(string dayKey)
+        {
+            _dayKey = dayKey ?? "";
+            OpenDrawerForTest("day");
+        }
 
         private void SetMode(string mode)
         {
@@ -1283,11 +1305,11 @@ namespace TomatoFocus.Ui
         }
         public void SetConfirmStop(bool visible) { _confirmStop = visible; A("confirm", 0f, 100f).Jump(visible ? 1f : 0f); }
 
-        private void DrawIconButton(Painter pt, string id, RectangleF r, string icon, bool active, Action onClick = null)
+        private void DrawIconButton(Painter pt, string id, RectangleF r, string icon, bool active, Action onClick = null, bool enabled = true)
         {
             var t = pt.T;
-            float hv = HoverAmount(id);
-            float pv = PressAmount(id);
+            float hv = enabled ? HoverAmount(id) : 0f;
+            float pv = enabled ? PressAmount(id) : 0f;
             // 悬停放大、按下回缩（热区保持原尺寸，避免边缘抖动）
             float grow = hv * 1.6f - pv * 2.4f;
             var rr = RectangleF.Inflate(r, grow, grow);
@@ -1299,9 +1321,10 @@ namespace TomatoFocus.Ui
             if (borderK > 0.01f)
                 pt.StrokeRound(rr, 10f, Theme.Alpha(t.Accent, (int)(210 * borderK)), 1f + hv * 0.6f);
 
-            var col = active ? t.AccentDark : Theme.Blend(t.TextMuted, t.AccentDark, hv);
+            var col = !enabled ? Theme.Alpha(t.TextMuted, 130)
+                    : active ? t.AccentDark : Theme.Blend(t.TextMuted, t.AccentDark, hv);
             IconArt.Draw(pt, icon, RectangleF.Inflate(rr, -10, -10), col, 1.8f + hv * 0.6f);
-            Hot(id, r, onClick);
+            Hot(id, r, enabled ? onClick : null);
         }
 
         // --- 专注面板 ------------------------------------------------------
