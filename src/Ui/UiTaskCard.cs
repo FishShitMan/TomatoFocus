@@ -193,13 +193,9 @@ namespace TomatoFocus.Ui
             }
             else if (away)
             {
-                if (st.ContinuousAwaySec >= TaskRunner.AwayGraceSeconds)
-                    info = I18n.T("task.away.paused", st.ContinuousAwaySec);   // 已经自动暂停，别再显示"还剩 0 秒"
-                else
-                {
-                    int left = Math.Max(0, TaskRunner.AwayGraceSeconds - st.ContinuousAwaySec);
-                    info = I18n.T("task.away", st.ContinuousAwaySec) + "  " + I18n.T("task.away.left", left);
-                }
+                // 已进入「已偏离」：只报"进入偏离后过了多久"，不再提示"还剩 X 秒自动暂停"
+                // （那时计时早已暂停，倒计时没有意义）
+                info = I18n.T("task.away.paused", st.ContinuousAwaySec);
                 infoColor = t.Warn;
             }
             else info = I18n.T("task.round", st.RoundIndex, st.RoundsTotal);
@@ -335,6 +331,83 @@ namespace TomatoFocus.Ui
             float hw = card.Right - 24 - hx;
             var hint = hw > 24f ? new RectangleF(hx, by + 10, hw, 18) : RectangleF.Empty;
             return new[] { cont, end, hint };
+        }
+
+        /// <summary>
+        /// 第 4 次偏离把任务结束之后的一次性提示：「上次的任务中断了，再接再厉吧」。
+        /// 单按钮、整窗屏障，点「知道了」收起。
+        /// </summary>
+        private void DrawSettledNotice(Painter pt)
+        {
+            var task = _app.Task;
+            if (task == null || !task.SettledNotice) return;
+
+            var t = pt.T;
+            var b = Bounds;
+            float w = Math.Min(460f, b.Width - 80f);
+            float h = 190f;
+            var card = new RectangleF(b.Width / 2f - w / 2f, b.Height / 2f - h / 2f, w, h);
+
+            using (var dim = new SolidBrush(Theme.Alpha(Color.Black, 96)))
+                pt.Raw.FillRectangle(dim, 0, 0, b.Width, b.Height);
+            Hot("settledNoticeBackdrop", new RectangleF(0, 0, b.Width, b.Height), null);
+
+            pt.Shadow(card, 20f, 12f, t.Shadow);
+            pt.FillRound(card, 20f, t.Surface);
+            pt.StrokeRound(card, 20f, Theme.Alpha(t.Warn, 170), 1.4f);
+
+            pt.Text(I18n.T("task.settledNotify.title"), pt.F(15f, true), t.Warn,
+                new RectangleF(card.Left + 24, card.Top + 20, w - 48, 24));
+            pt.Text(I18n.T("task.settledNotify.body"), pt.F(13f), t.Text,
+                new RectangleF(card.Left + 24, card.Top + 52, w - 48, 26));
+            pt.Text(I18n.T("task.settledNotify.hint"), pt.F(10.5f), t.TextMuted,
+                new RectangleF(card.Left + 24, card.Top + 84, w - 48, 20));
+
+            var ok = new RectangleF(card.Left + 24, card.Bottom - 56, 110, 38);
+            pt.FillRound(ok, 19f, t.Accent);
+            pt.TextCenter(I18n.T("task.settledNotify.ok"), pt.F(12f, true), Color.White, ok);
+            Hot("settledNoticeOk", ok, delegate { task.DismissSettledNotice(); _dirty = true; });
+        }
+
+        /// <summary>
+        /// 「再偏离就要结束任务」的中部强提醒：第 3 次偏离时弹出，两枚按钮——
+        /// 确认（进入第 4 次检测，下次离开直接按中断结束）/ 我在处理其他事务（暂停并清零重计）。
+        /// </summary>
+        private void DrawAwayWarning(Painter pt)
+        {
+            var task = _app.Task;
+            if (task == null || !task.AwayWarning) return;
+
+            var t = pt.T;
+            var b = Bounds;
+            float w = Math.Min(520f, b.Width - 80f);
+            float h = 200f;
+            var card = new RectangleF(b.Width / 2f - w / 2f, b.Height / 2f - h / 2f, w, h);
+
+            using (var dim = new SolidBrush(Theme.Alpha(Color.Black, 96)))
+                pt.Raw.FillRectangle(dim, 0, 0, b.Width, b.Height);
+            // 整窗屏障：弹窗后面的一切都不该被点中
+            Hot("awayWarnBackdrop", new RectangleF(0, 0, b.Width, b.Height), null);
+
+            pt.Shadow(card, 20f, 12f, t.Shadow);
+            pt.FillRound(card, 20f, t.Surface);
+            pt.StrokeRound(card, 20f, Theme.Alpha(t.Warn, 190), 1.4f);
+
+            pt.Text(I18n.T("task.away.warn.title", task.AwayCount), pt.F(15f, true), t.Warn,
+                new RectangleF(card.Left + 24, card.Top + 20, w - 48, 24));
+            pt.Text(I18n.T("task.away.warn.body"), pt.F(12.5f), t.Text,
+                new RectangleF(card.Left + 24, card.Top + 54, w - 48, 48));
+
+            float by = card.Bottom - 56;
+            var ok = new RectangleF(card.Left + 24, by, 110, 38);
+            pt.FillRound(ok, 19f, t.Accent);
+            pt.TextCenter(I18n.T("task.away.warn.ok"), pt.F(12f, true), Color.White, ok);
+            Hot("awayWarnOk", ok, delegate { task.ConfirmAwayWarning(); _dirty = true; });
+
+            var defer = new RectangleF(ok.Right + 12, by, 170, 38);
+            pt.FillRound(defer, 19f, t.SurfaceAlt);
+            pt.TextCenter(I18n.T("task.away.warn.defer"), pt.F(11.5f, true), t.TextMuted, defer);
+            Hot("awayWarnDefer", defer, delegate { task.DeferAwayWarning(); _dirty = true; });
         }
 
         /// <summary>「任务被异常中断，是否继续？」弹窗（目标程序崩溃 / 程序自身崩溃后首启）。</summary>

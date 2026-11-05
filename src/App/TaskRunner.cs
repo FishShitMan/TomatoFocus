@@ -13,7 +13,7 @@ namespace TomatoFocus.Core
     internal sealed class TaskRunner
     {
         /// <summary>连续偏离宽限（秒）：超过就自动暂停，避免长时间脱离。</summary>
-        public const int AwayGraceSeconds = 120;
+        public const int AwayGraceSeconds = 60;
 
         /// <summary>抓取前台程序的倒计时（秒）。</summary>
         public const int GrabCountdownSeconds = 3;
@@ -124,7 +124,7 @@ namespace TomatoFocus.Core
         {
             LastStartError = "";
 
-            if (_app.Timer.Phase != TimerPhase.Idle) { LastStartError = "task.busy"; return false; }
+            if (_app.Timer.Phase != TimerPhase.Idle) { LastStartError = "focus.busy"; return false; }
             if (State != null && State.IsActive) { LastStartError = "task.busy"; return false; }
 
             var cfg = _app.Data.TaskConfig;
@@ -152,6 +152,7 @@ namespace TomatoFocus.Core
             _app.Data.CurrentTask = st;
             _lastSampleMs = -1;
             ProgramAlive = true;
+            ResetAwayTracking();
             _app.Data.Settings.NoteDraft = "";    // 新任务从空白笔记开始
             StartRound(0);
             _app.Save();
@@ -214,16 +215,28 @@ namespace TomatoFocus.Core
             _app.Save();
         }
 
-        /// <summary>跳过休息 → 直接进下一轮专注。</summary>
+        /// <summary>
+        /// 跳过休息 → 直接进下一轮专注。
+        /// 两种入口都要接住：
+        /// ① 休息卡上点「跳过休息」（此刻计时器空闲）；
+        /// ② 主界面 / 托盘在**休息进行中**点「跳过」（此刻 Phase = Break）。
+        /// 以前只处理了 ①，从主界面跳过时休息被清掉、任务却没进下一轮，
+        /// 于是出现"任务卡写着专注中、计时器却是准备开始、还开不了新计时"的死局。
+        /// </summary>
         public void SkipBreak()
         {
             var st = State;
             if (st == null) return;
-            if (_app.Timer.Phase != TimerPhase.Idle) return;   // 同上：空转时才允许跳轮
-            _app.Timer.Reset();
+
+            if (_app.Timer.Phase == TimerPhase.Break || _app.Timer.Phase == TimerPhase.PausedBreak)
+                _app.Timer.SkipBreak();            // 正在休息 → 回到空闲
+            else if (_app.Timer.Phase != TimerPhase.Idle)
+                return;                            // 专注中：不是跳过休息的时机
+
             _app.DismissReminder();
-            StartRound(st.RoundIndex);
+            StartRound(st.RoundIndex);             // RoundIndex 已是"下一轮"
             _app.Save();
+            _app.BumpBeat();
         }
 
         // --- 结算 -----------------------------------------------------------
@@ -236,6 +249,7 @@ namespace TomatoFocus.Core
             if (focused > st.TotalFocusSeconds) focused = st.TotalFocusSeconds;
             _app.RecordTaskSession(st, focused, outcome);
             _app.Data.CurrentTask = null;
+            ResetAwayTracking();
             _app.DismissReminder();
             _app.Timer.Reset();
             _app.Save();
@@ -313,6 +327,139 @@ namespace TomatoFocus.Core
         public void EndFromInterrupted()
         {
             Finish(TaskMath.TaskOutcome.Abandoned);
+        }
+
+        /// <summary>调试「立即检测是否偏离任务」的判定结果。</summary>
+        public enum AwayProbeResult
+        {
+            /// <summary>当前没有进行中的任务。</summary>
+            NoTask,
+            /// <summary>目标程序正在前台：未偏离，什么都不做。</summary>
+            OnTarget,
+            /// <summary>本来就处于「已偏离」：不重复计数。</summary>
+            AlreadyAway,
+            /// <summary>已立刻置为「已偏离」，计数 +1。</summary>
+            Entered,
+            /// <summary>这一下是第 4 次偏离，任务已按中断结束。</summary>
+            Finished
+        }
+
+        /// <summary>
+        /// 调试用：立刻抓一次前台程序。
+        /// 目标程序在前台 → 什么都不做；不在前台 → 立即进入「已偏离」（不等 60 秒宽限），
+        /// 并让偏离计数 +1（若已点过「确认」，这一次就是第 4 次，直接按中断结束任务）。
+        /// </summary>
+        public AwayProbeResult DebugForceAway()
+        {
+            var st = State;
+            if (st == null || !st.IsActive) return AwayProbeResult.NoTask;
+
+            var fg = Native.ForegroundProcess();
+            bool match = fg != null && TaskMath.MatchProcess(st.ProcessName, st.Pid, fg.ProcessName, fg.Pid);
+            if (match) return AwayProbeResult.OnTarget;
+
+            // 已经在「已偏离」：保持一次偏离=一次计数的不变式，不重复加
+            if (st.Status == TaskState.StatusAway) return AwayProbeResult.AlreadyAway;
+
+            st.AwaySec += AwayGraceSeconds;
+            st.ContinuousAwaySec = 0;          // 卡片秒数同样从 0 起
+            if (_app.Timer.Phase == TimerPhase.Focusing) _app.Timer.Pause();
+            st.Status = TaskState.StatusAway;
+
+            if (AwayArmed)
+            {
+                AwayArmed = false;
+                AwayWarning = false;
+                Log.Info("task: 调试触发第 4 次偏离，按中断结束任务");
+                int reached = AwayCount + 1;      // 这一次也算，且 Finish 会清零，先记下来
+                Finish(TaskMath.TaskOutcome.Abandoned);
+                SettledAwayCount = reached;
+                SettledNotice = true;
+                _app.ShowToast(I18n.T("task.away.autoEnded", reached));
+                _app.BumpBeat();
+                return AwayProbeResult.Finished;
+            }
+
+            AwayCount++;
+            if (AwayTriggersWarning(AwayCount, AwayArmed, AwayWarning)) AwayWarning = true;
+            _app.Save();
+            _app.BumpBeat();
+            Log.Info("task: 调试强制偏离，计数 " + AwayCount);
+            return AwayProbeResult.Entered;
+        }
+
+        // --- 偏离次数与强提醒 -------------------------------------------------
+        /// <summary>离开目标程序满这么多次后开始"再走就结束"的强提醒。</summary>
+        public const int AwayWarnAfter = 3;
+
+        /// <summary>
+        /// 已发生的「已偏离」次数：**进入一次"已偏离"状态才算一次**
+        /// （即离开目标程序满 <see cref="AwayGraceSeconds"/> 秒、计时被暂停那一刻）。
+        /// 回来以后再离开，重新数 60 秒才会再 +1。
+        /// </summary>
+        public int AwayCount;
+
+        /// <summary>用户点过「确认」：下一次进入「已偏离」就直接按中断结束任务。</summary>
+        public bool AwayArmed;
+
+        /// <summary>正在显示"再偏就结束"的中部强提醒。</summary>
+        public bool AwayWarning;
+
+        /// <summary>第 4 次偏离把任务结束后，弹一次"再接再厉"的中部提示，等用户点「知道了」。</summary>
+        public bool SettledNotice;
+
+        /// <summary>结束时的偏离次数（Finish 会把 AwayCount 清零，这里留一份给提示文案用）。</summary>
+        public int SettledAwayCount = 1;
+
+        /// <summary>累计到第 3 次「已偏离」之后、用户回来时要不要弹强提醒（纯函数，便于测试）。</summary>
+        internal static bool AwayTriggersWarning(int count, bool armed, bool warning)
+        {
+            return !armed && !warning && count >= AwayWarnAfter;
+        }
+
+        private void ResetAwayTracking()
+        {
+            AwayCount = 0;
+            AwayArmed = false;
+            AwayWarning = false;
+        }
+
+        /// <summary>强提醒「确认」：进入第 4 次检测——下次离开目标程序立即按中断结束任务。</summary>
+        public void ConfirmAwayWarning()
+        {
+            var st = State;
+            if (st == null) { AwayWarning = false; return; }
+
+            AwayWarning = false;
+            AwayArmed = true;
+            st.Status = TaskState.StatusRunning;
+            st.ContinuousAwaySec = 0;
+            if (_app.Timer.Phase == TimerPhase.Paused) _app.Timer.Resume();
+            _app.Save();
+            _app.BumpBeat();
+        }
+
+        /// <summary>强提醒「我在处理其他事务」：暂停计时，并把偏离次数归零重新开始计。</summary>
+        public void DeferAwayWarning()
+        {
+            var st = State;
+            if (st == null) { AwayWarning = false; return; }
+
+            AwayWarning = false;
+            AwayArmed = false;
+            AwayCount = 0;
+            st.Status = TaskState.StatusAway;
+            st.ContinuousAwaySec = 0;
+            if (_app.Timer.Phase == TimerPhase.Focusing) _app.Timer.Pause();
+            _app.Save();
+            _app.BumpBeat();
+        }
+
+        /// <summary>「任务中断了，再接再厉」提示点「知道了」后收起。</summary>
+        public void DismissSettledNotice()
+        {
+            SettledNotice = false;
+            _app.BumpBeat();
         }
 
         // --- 目标程序检测（手动刷新 / 程序重新启动）--------------------------
@@ -393,6 +540,19 @@ namespace TomatoFocus.Core
             if (_lastSampleMs >= 0 && unchecked(nowMs - _lastSampleMs) < 1000) return;
             _lastSampleMs = nowMs;
 
+            // 兜底自愈：任务还在跑、计时器却空闲、又没有待处理的休息卡 —— 这一轮丢了。
+            // （旧版本从主界面「跳过」休息就会留下这种死局：任务卡写"专注中"、
+            //   计时器却是"准备开始"，而且开不了新计时，只能重启程序。）
+            // 这里直接重开当前轮，把用户从死局里捞出来。
+            if (st.Status == TaskState.StatusRunning && _app.Timer.Phase == TimerPhase.Idle &&
+                _app.Pending == null && !AwayWarning)
+            {
+                Log.Info("task: 检测到计时器空转（无待办休息卡），自动重开当前轮");
+                StartRound(st.RoundIndex - 1);
+                _app.Save();
+                return;
+            }
+
             // 只有"专注轮（含暂停）"才做前台检测：休息轮不检测
             if (_app.Timer.Phase != TimerPhase.Focusing && _app.Timer.Phase != TimerPhase.Paused) return;
 
@@ -430,9 +590,25 @@ namespace TomatoFocus.Core
 
             if (match)
             {
-                if (st.ContinuousAwaySec != 0 || st.Status == TaskState.StatusAway)
+                bool hadAway = st.ContinuousAwaySec > 0 || st.Status == TaskState.StatusAway;
+                st.ContinuousAwaySec = 0;
+
+                // 强提醒还挂着：保持暂停，等用户点按钮（否则下一秒又会被自动续上）
+                if (AwayWarning) return;
+
+                if (AwayTriggersWarning(AwayCount, AwayArmed, AwayWarning))
                 {
-                    st.ContinuousAwaySec = 0;
+                    // 第 3 次"已偏离"之后又回来了：中部强提醒 + 保持暂停，等用户选
+                    // 「确认」（进入第 4 次检测）还是「我在处理其他事务」（清零重计）
+                    AwayWarning = true;
+                    st.Status = TaskState.StatusAway;
+                    _app.Save();
+                    _app.BumpBeat();
+                    return;
+                }
+
+                if (hadAway)
+                {
                     st.Status = TaskState.StatusRunning;
                     if (_app.Timer.Phase == TimerPhase.Paused) _app.Timer.Resume();
                     _app.Save();
@@ -442,18 +618,64 @@ namespace TomatoFocus.Core
             }
 
             // 偏离（软检测）：照常计时，只累计偏离秒数。
-            // **只有真的在专注时才累计**：已经暂停/已经自动暂停后还继续累加，
-            // 会让任务卡上的"已偏离 141 秒 / 还剩 0 秒自动暂停"一直涨个不停。
-            if (_app.Timer.Phase != TimerPhase.Focusing) return;
+            if (_app.Timer.Phase == TimerPhase.Focusing) { TickAway(); return; }
+
+            // 已经进入「已偏离」：计时器是暂停的，但秒数要继续走——
+            // 任务卡上的"已偏离 X 秒"是实时读数，停住会让人以为卡死。
+            if (st.Status == TaskState.StatusAway) TickAway();
+        }
+
+        /// <summary>
+        /// 偏离累计 1 秒。
+        /// **满 60 秒才算一次偏离**：暂停计时、状态转「已偏离」、计数 +1；
+        /// 若此前已点过「确认」，这第 4 次偏离直接按中断结束任务。
+        /// 抽成独立方法是为了能脱离"每秒采样"直接测这条状态机。
+        /// </summary>
+        /// <returns>true 表示已进入「已偏离」或任务已结束，本轮不必再做别的。</returns>
+        internal bool TickAway()
+        {
+            var st = State;
+            if (st == null) return true;
+
             st.AwaySec++;
             st.ContinuousAwaySec++;
             _app.BumpBeat();                     // 逐秒文案：让卡片立刻刷新
-            if (st.ContinuousAwaySec >= AwayGraceSeconds)
+
+            // 已经在「已偏离」里：只滚秒数，不重复计数、也不重复暂停
+            if (st.Status == TaskState.StatusAway) return true;
+
+            if (st.ContinuousAwaySec < AwayGraceSeconds) return false;
+
+            // 满 60 秒：进入「已偏离」
+            if (_app.Timer.Phase == TimerPhase.Focusing) _app.Timer.Pause();
+            st.Status = TaskState.StatusAway;
+            // 卡片上的"已偏离 X 秒"从进入偏离这一刻起从 0 开始爬（回到目标程序时再清零）
+            st.ContinuousAwaySec = 0;
+
+            if (AwayArmed)
             {
-                _app.Timer.Pause();
-                st.Status = TaskState.StatusAway;
-                _app.Save();
+                AwayArmed = false;
+                AwayWarning = false;
+                Log.Info("task: 第 4 次偏离目标程序，按中断结束任务");
+                int reached = AwayCount + 1;      // 这一次也算，且 Finish 会清零，先记下来
+                Finish(TaskMath.TaskOutcome.Abandoned);
+                // 结算完成后再弹"再接再厉"：Finish 会重置偏离相关状态，所以放在它后面
+                SettledAwayCount = reached;
+                SettledNotice = true;
+                // 顶部提示：说清楚"偏离了几次 + 任务被自动中断了"
+                _app.ShowToast(I18n.T("task.away.autoEnded", reached));
+                _app.BumpBeat();
+                return true;
             }
+
+            AwayCount++;                          // 一次「已偏离」= 计数 +1
+            // 第 3 次**当场**就弹强提醒：不再等"回到目标程序"那一刻。
+            // （用调试按钮或卡片「继续」时永远不经过那条路径，会一路越过阈值不弹窗。）
+            if (AwayTriggersWarning(AwayCount, AwayArmed, AwayWarning)) AwayWarning = true;
+            _app.Save();
+            _app.BumpBeat();
+            Log.Info("task: 第 " + AwayCount + " 次偏离目标程序（已暂停）");
+            return true;
         }
     }
 }

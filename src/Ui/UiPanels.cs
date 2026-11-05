@@ -1119,8 +1119,10 @@ namespace TomatoFocus.Ui
                     Theme.Alpha(t.TextMuted, hasNote ? 255 : 130), keep2);
                 Hot("remKeep", keep2, delegate
                 {
+                    // 任务模式的休息卡**不能**因为"保留笔记"就收起：
+                    // 这一轮还没决定（休息多久 / 跳过），收起后任务会停在"没有计时"的死局里。
                     ShowToast(I18n.T(_app.KeepLastNote() ? "break.keepNote.done" : "break.keepNote.none"));
-                    _app.DismissReminder();
+                    _dirty = true;
                 });
                 return;
             }

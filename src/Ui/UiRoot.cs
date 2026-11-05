@@ -293,6 +293,9 @@ namespace TomatoFocus.Ui
                 if (_toastT > 0) return false;
                 var st = _app.Data.CurrentTask;
                 if (st != null && st.Status == TaskState.StatusInterrupted) return false;   // 模态卡盖住环
+                // 偏离强提醒 / 「再接再厉」提示也是整窗模态卡：显示期间禁用"只刷环"，
+                // 否则快路径会把计数环叠到弹窗上面（环压着卡片，看着像渲染错乱）。
+                if (_app.Task != null && (_app.Task.AwayWarning || _app.Task.SettledNotice)) return false;
                 return true;
             }
         }
@@ -377,7 +380,7 @@ namespace TomatoFocus.Ui
 
         private void SetMode(string mode)
         {
-            if (_app.Timer.Phase != TimerPhase.Idle) { ShowToast(I18n.T("focus.presetLocked")); return; }
+            if (_app.Timer.Phase != TimerPhase.Idle) { ShowPresetLockedToast(); return; }
             if (_mode == mode) return;
             _mode = mode;
             _customFocus = false;
@@ -776,12 +779,25 @@ namespace TomatoFocus.Ui
             return true;
         }
 
+        /// <summary>
+        /// 「计时中不能切档」的提示：按当前阶段给说法。
+        /// 以前固定用「正在专注中」，休息中点了也这么说，看着像串台。
+        /// </summary>
+        private void ShowPresetLockedToast()
+        {
+            var phase = _app.Timer.Phase;
+            string key = (phase == TimerPhase.Break || phase == TimerPhase.PausedBreak) ? "focus.presetLocked.rest"
+                       : (phase == TimerPhase.Paused) ? "focus.presetLocked.paused"
+                       : "focus.presetLocked";
+            ShowToast(I18n.T(key));
+        }
+
         /// <summary>只选择档位，不自动开始计时。</summary>
         private void SelectPreset(int minutes, string preset)
         {
             if (_app.Timer.Phase != TimerPhase.Idle)
             {
-                ShowToast(I18n.T("focus.presetLocked"));
+                ShowPresetLockedToast();
                 return;
             }
             if (_mode == "break")
@@ -810,7 +826,11 @@ namespace TomatoFocus.Ui
                     _app.Timer.Resume();
                     break;
                 case TimerPhase.PausedBreak: _app.Timer.Resume(); break;   // 继续休息
-                case TimerPhase.Break: _app.Timer.SkipBreak(); break;
+                case TimerPhase.Break:
+                    // 任务模式下的休息：必须走 TaskRunner，否则休息被清掉、任务却不进下一轮（死局）
+                    if (_app.Task != null && _app.Task.Active) _app.Task.SkipBreak();
+                    else _app.Timer.SkipBreak();
+                    break;
                 default:
                     // 自定输入中：有效数值则直接开始倒计时；尚未输入或无效则什么都不做
                     if (_customFocus) { TryCommitCustom(true); return; }
@@ -821,13 +841,38 @@ namespace TomatoFocus.Ui
         }
 
         /// <summary>
+        /// 「继续」此刻是否该被禁用：
+        /// ① 任务在「已偏离」——人不在目标程序前，续上等于对着空气计时；
+        /// ② 任务在「目标程序已退出」且确实没在运行。
+        /// </summary>
+        private bool ResumeBlocked()
+        {
+            var task = _app.Data.CurrentTask;
+            if (task == null || !task.IsActive) return false;
+            if (task.Status == TaskState.StatusAway) return true;
+            if (task.Status == TaskState.StatusProgramGone &&
+                !(_app.Task != null && _app.Task.ProgramAlive)) return true;
+            return false;
+        }
+
+        /// <summary>
         /// 能否点「继续」：任务处于"程序已退出"且目标进程确实不在时禁止，
-        /// 并顺手触发一次重新检测（提示与手动刷新体验一致）。
+        /// 并顺手触发一次重新检测（提示与手动刷新体验一致）；
+        /// 任务处于「已偏离」时也禁止（先切回目标程序，或在任务卡点「继续」）。
         /// </summary>
         private bool AllowResumeTask()
         {
             var task = _app.Data.CurrentTask;
-            if (task == null || task.Status != TaskState.StatusProgramGone) return true;
+            if (task == null) return true;
+
+            if (task.Status == TaskState.StatusAway)
+            {
+                ShowToast(I18n.T("task.resume.blocked"));
+                _dirty = true;
+                return false;
+            }
+
+            if (task.Status != TaskState.StatusProgramGone) return true;
             if (_app.Task != null && _app.Task.ProgramAlive) return true;
 
             if (_app.Task != null) _app.Task.Recheck();
@@ -925,6 +970,8 @@ namespace TomatoFocus.Ui
             DrawGreetingCard(pt);
             DrawDrawer(pt);      // 抽屉永远在最上层，避免层级与热区错乱
             DrawToast(pt);
+            DrawAwayWarning(pt);       // 偏离强提醒（中部模态卡）
+            DrawSettledNotice(pt);     // 任务被偏离结束后的一次性提示
             DrawTaskInterrupted(pt);   // 任务异常中断弹窗（最上层模态卡）
             DrawDebugPanel(pt);
             PerfCounters.Add("其它层", ts);
@@ -941,7 +988,7 @@ namespace TomatoFocus.Ui
                 pt.Raw.FillRectangle(dim, 0, 0, b.Width, b.Height);
             Hot("debugBackdrop", new RectangleF(0, 0, b.Width, b.Height), delegate { _debugOpen = false; _dirty = true; });
 
-            float w = 330f, h = 344f;
+            float w = 330f, h = 392f;
             var card = new RectangleF(b.Width / 2f - w / 2f, b.Height / 2f - h / 2f, w, h);
             pt.Shadow(card, 18f, 12f, t.Shadow);
             pt.FillRound(card, 16f, t.Surface);
@@ -961,6 +1008,29 @@ namespace TomatoFocus.Ui
                 delegate { _app.DebugUnlockAllRewards(); });
             y = DebugButton(pt, card, y, "dbgFinish", I18n.T("debug.finishTimer"),
                 delegate { _app.DebugCompleteTimer(); _debugOpen = false; _dirty = true; });
+            y = DebugButton(pt, card, y, "dbgAway", I18n.T("debug.probeAway"), delegate
+            {
+                var r = _app.Task.DebugForceAway();
+                _debugOpen = false;      // toast 画在调试面板下面，先关面板才看得见
+                if (r == TaskRunner.AwayProbeResult.Finished)
+                {
+                    // 第 4 次：core 已经弹了「您偏离目标 X 次了，任务已自动中断」，别再覆盖它
+                    _dirty = true;
+                    return;
+                }
+                string key;
+                switch (r)
+                {
+                    case TaskRunner.AwayProbeResult.OnTarget: key = "debug.probe.onTarget"; break;
+                    case TaskRunner.AwayProbeResult.AlreadyAway: key = "debug.probe.already"; break;
+                    case TaskRunner.AwayProbeResult.Entered: key = "debug.probe.entered"; break;
+                    default: key = "debug.probe.noTask"; break;
+                }
+                ShowToast(r == TaskRunner.AwayProbeResult.Entered
+                    ? I18n.T(key, _app.Task.AwayCount)
+                    : I18n.T(key));
+                _dirty = true;
+            });
             y = DebugButton(pt, card, y, "dbgReport", I18n.T("debug.exportReport"),
                 delegate
                 {
@@ -1486,8 +1556,11 @@ namespace TomatoFocus.Ui
                     : focusing ? I18n.T("focus.pause")
                     : paused ? I18n.T("focus.resume")
                     : I18n.T("focus.start");
+                // 暂停态下若"继续"会被拦（偏离 / 目标程序没开），按钮直接画成禁用态
+                bool primaryEnabled = !(paused && ResumeBlocked());
                 DrawPrimaryButton(pt, "btnPrimary", primary, primaryLabel,
-                    breaking ? "pause" : (focusing ? "pause" : "play"), ToggleStartPause, Tint(t.Accent));
+                    breaking ? "pause" : (focusing ? "pause" : "play"), ToggleStartPause, Tint(t.Accent),
+                    primaryEnabled);
 
                 if (secondaryW > 1.5f)
                 {
@@ -1497,7 +1570,13 @@ namespace TomatoFocus.Ui
                         // 暂停的休息：主按钮"继续休息"，次按钮直接"跳过休息"
                         // （不能走"结束本轮"确认条——那会把休息当专注结算，凭空记一笔）
                         DrawGhostButton(pt, "btnStop", secondary, I18n.T("break.skip"), "stop",
-                            delegate { _app.Timer.SkipBreak(); _dirty = true; }, showStop);
+                            delegate
+                            {
+                                // 任务模式下同样要走 TaskRunner，否则任务会停在"没有计时"的死局里
+                                if (_app.Task != null && _app.Task.Active) _app.Task.SkipBreak();
+                                else _app.Timer.SkipBreak();
+                                _dirty = true;
+                            }, showStop);
                     }
                     else
                     {
@@ -1615,7 +1694,10 @@ namespace TomatoFocus.Ui
                 pt.TextCenter(label, font,
                     selected ? Color.White : Theme.Blend(t.TextMuted, Theme.Shade(Tint(t.Accent), -0.25f), hv), rr);
                 int mm = m;
-                string ps = mm == 5 ? "5" : mm == 15 ? "15" : mm == 25 ? "25" : "custom";
+                // 档位 id 必须按"当前模式的固定档位表"来定，不能写死 5/15/25：
+                // 休息模式的固定档是 5/10/15，以前 10 分会掉进 else 被当成「自定」，
+                // 于是点 10 分顺手把自定时长也改成了 10 分。
+                string ps = presets.Contains(mm) ? mm.ToString(System.Globalization.CultureInfo.InvariantCulture) : "custom";
                 Hot(id, r, delegate { SelectPreset(mm, ps); });
                 x += w + gap;
             }
@@ -1654,7 +1736,7 @@ namespace TomatoFocus.Ui
 
                 Hot("presetCustom", r, delegate
                 {
-                    if (_app.Timer.Phase != TimerPhase.Idle) { ShowToast(I18n.T("focus.presetLocked")); return; }
+                    if (_app.Timer.Phase != TimerPhase.Idle) { ShowPresetLockedToast(); return; }
                     _customFocus = true;
                     _customInput = "";
                 });
@@ -1725,13 +1807,29 @@ namespace TomatoFocus.Ui
             pt.TextCenter(text, pt.F(12f), t.TextMuted, r);
         }
 
-        private void DrawPrimaryButton(Painter pt, string id, RectangleF r, string label, string icon, Action onClick, Color tint)
+        private void DrawPrimaryButton(Painter pt, string id, RectangleF r, string label, string icon, Action onClick, Color tint, bool enabled = true)
         {
             var t = pt.T;
-            float hv = HoverAmount(id);
-            float pv = PressAmount(id);
+            float hv = enabled ? HoverAmount(id) : 0f;
+            float pv = enabled ? PressAmount(id) : 0f;
             var rr = RectangleF.Inflate(r, -pv * 2f + hv * 1.5f, -pv * 2f + hv * 1.5f);
             rr.Offset(0, -hv * 1.2f);   // 悬停时轻微上浮
+
+            if (!enabled)
+            {
+                // 禁用态：压暗、去掉发光与阴影，文字转灰，视觉上一眼看出点不了
+                pt.FillRound(rr, 16f, Theme.Blend(t.SurfaceAlt, tint, 0.18f));
+                pt.StrokeRound(rr, 16f, Theme.Alpha(t.Border, 200), 1f);
+                var dfont = pt.F(15.5f, true);
+                float dw = pt.TextWidth(label, dfont);
+                float dtotal = dw + 22f + 10f;
+                float dx = rr.Left + (rr.Width - dtotal) / 2f;
+                IconArt.Draw(pt, icon, new RectangleF(dx, rr.Top + rr.Height / 2 - 10, 20, 20), Theme.Alpha(t.TextMuted, 150), 2.2f);
+                pt.TextCenterV(label, dfont, Theme.Alpha(t.TextMuted, 170), dx + 22f + 10f, rr);
+                Hot(id, r, onClick);   // 仍可点：点了会弹"为什么不能继续"的提示
+                return;
+            }
+
             pt.Shadow(rr, 16f, 8f + hv * 5f, Theme.Alpha(tint, (int)(55 + 70 * hv)));
             pt.VerticalGradient(rr, Theme.Shade(tint, 0.10f + hv * 0.14f), Theme.Shade(tint, -0.22f + hv * 0.10f), 16f);
 

@@ -257,6 +257,16 @@ namespace TomatoFocus.Core
         /// <summary>调试用：立即把当前专注推进到完成，走与自然结束完全相同的结算路径。</summary>
         public void DebugCompleteNow()
         {
+            // 休息阶段也要能"一键完成"，否则调试按钮在休息时毫无反应
+            if (Phase == TimerPhase.Break || Phase == TimerPhase.PausedBreak)
+            {
+                Phase = TimerPhase.Break;
+                _lastMono = MonoNow();
+                _lastWall = WallNow();
+                _elapsed = BreakSeconds;
+                CheckCompletion();
+                return;
+            }
             if (Phase != TimerPhase.Focusing && Phase != TimerPhase.Paused) return;
             Phase = TimerPhase.Focusing;
             _elapsed = PlannedSeconds;

@@ -258,7 +258,12 @@ namespace TomatoFocus.Tray
             }
             else if (timer.Phase == TimerPhase.Break)
             {
-                AddItem(menu, I18n.T("break.skip"), delegate { timer.SkipBreak(); });
+                AddItem(menu, I18n.T("break.skip"), delegate
+                {
+                    // 任务模式下必须走 TaskRunner：否则休息被清掉、任务却不进下一轮
+                    if (app.Task != null && app.Task.Active) app.Task.SkipBreak();
+                    else timer.SkipBreak();
+                });
             }
             else if (app.Task != null && app.Task.Active)
             {

@@ -91,6 +91,10 @@ namespace TomatoFocus.Tests
                 TestSessionRecovery();
                 TestTaskStateGuards();
                 TestOverlayAndDayPaging();
+                TestPresetMapping();
+                TestAwayWarning();
+                TestBreakSkipAndHeal();
+                TestAwayProbeAndResumeLock();
                 TestBugFixesBatch1();
             }
             catch (Exception ex)
@@ -1289,7 +1293,7 @@ namespace TomatoFocus.Tests
 
             // ⑤ 版本号来自程序集且与 AssemblyInfo 一致
             True("版本号已更新", AppInfo.Version != "1.0" && AppInfo.Version.Length > 0, "版本 " + AppInfo.Version);
-            Eq("版本号与程序集一致", AppInfo.Version, "1.6.2");
+            Eq("版本号与程序集一致", AppInfo.Version, "1.6.3");
         }
         /// <summary>笔记与红点的回归测试。</summary>
         private static void TestNotesAndBadge()
@@ -3106,7 +3110,7 @@ namespace TomatoFocus.Tests
             var app = new AppState();
             app.Timer.StartFocus(25, "25");
             True("计时中拒绝开始任务", !app.Task.Start());
-            Eq("拒绝原因=计时中", app.Task.LastStartError, "task.busy");
+            Eq("拒绝原因=计时中", app.Task.LastStartError, "focus.busy");
             app.Timer.Reset();
 
             // ② 目标程序没在跑：不许开始（否则会开出一轮"注定抓不到程序"的计时）
@@ -3315,6 +3319,332 @@ namespace TomatoFocus.Tests
                 if (h.Rect.Contains(p)) return h.Id;
             }
             return "";
+        }
+
+        /// <summary>档位映射：休息模式的 10 分钟不能被当成「自定」。</summary>
+        private static void TestPresetMapping()
+        {
+            Group("档位映射");
+            var app = new AppState();
+            app.Data = new AppData();
+            I18n.Load(I18n.DefaultLang);
+            app.CurrentTheme = Theme.ById("fresh");
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app);
+                ui.Scale = 1f;
+                ui.Bounds = new RectangleF(0, 0, 1040, 700);
+                Settle(ui, g, 4);
+
+                var modeBreak = FindHot(new List<Hotspot>(ui.Hotspots), "modeBreak");
+                True("有「休息」模式按钮", modeBreak != null);
+                if (modeBreak != null) { var p = Center(modeBreak.Rect); ui.OnMouseDown(p); ui.OnMouseUp(p); }
+                Settle(ui, g, 10);
+                Eq("已切到休息模式", ui.CurrentMode, "break");
+
+                var p10 = FindHot(new List<Hotspot>(ui.Hotspots), "preset10");
+                True("休息模式有 10 分钟档位", p10 != null);
+                if (p10 != null) { var p = Center(p10.Rect); ui.OnMouseDown(p); ui.OnMouseUp(p); }
+                Eq("选中 10 分钟档", ui.BreakPresetMinutes, 10);
+                Eq("10 分钟不再被写进自定时长", app.Data.Settings.BreakCustomMinutes, 0);
+
+                app.Timer.Reset();
+                var modeFocus = FindHot(new List<Hotspot>(ui.Hotspots), "modeFocus");
+                if (modeFocus != null) { var p = Center(modeFocus.Rect); ui.OnMouseDown(p); ui.OnMouseUp(p); }
+                Settle(ui, g, 10);
+                var p15 = FindHot(new List<Hotspot>(ui.Hotspots), "preset15");
+                if (p15 != null) { var p = Center(p15.Rect); ui.OnMouseDown(p); ui.OnMouseUp(p); }
+                Eq("专注模式 15 分钟档", app.Timer.Preset, "15");
+                Eq("计划时长 15 分钟", app.Timer.PlannedSeconds, 900);
+                Eq("专注自定时长保持为空", app.Data.Settings.CustomMinutes, 0);
+            }
+        }
+
+        /// <summary>偏离强提醒：只有"满 60 秒进入已偏离"才计数，3 次后提醒，第 4 次结束任务。</summary>
+        private static void TestAwayWarning()
+        {
+            Group("偏离强提醒");
+
+            // ① 触发规则：第 3 次、未确认、未在弹窗中
+            True("第 3 次触发提醒", TaskRunner.AwayTriggersWarning(3, false, false));
+            True("第 2 次不触发", !TaskRunner.AwayTriggersWarning(2, false, false));
+            True("已确认后不再弹", !TaskRunner.AwayTriggersWarning(3, true, false));
+            True("已弹窗时不重复弹", !TaskRunner.AwayTriggersWarning(3, false, true));
+
+            var app = new AppState();
+            app.Data = new AppData();
+            app.Data.CurrentTask = new TaskState();
+            app.Data.CurrentTask.ProcessName = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
+            app.Data.CurrentTask.TotalFocusSeconds = 30 * 60;
+            app.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app.Data.CurrentTask.RoundsTotal = 2;
+            app.Data.CurrentTask.RoundIndex = 1;
+            app.Data.CurrentTask.Status = TaskState.StatusRunning;
+            app.Timer.StartFocus(15, "task");
+
+            // ② 不满 60 秒：只是"计时中"，不算一次偏离
+            for (int i = 0; i < TaskRunner.AwayGraceSeconds - 1; i++) app.Task.TickAway();
+            Eq("不满 60 秒不计数", app.Task.AwayCount, 0);
+            Eq("不满 60 秒仍在专注", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+
+            // ③ 满 60 秒 = 一次「已偏离」：计数 +1、暂停、状态转"已偏离"
+            app.Task.TickAway();
+            Eq("满 60 秒计数 +1", app.Task.AwayCount, 1);
+            Eq("满 60 秒进入已偏离", app.Data.CurrentTask.Status, TaskState.StatusAway);
+            Eq("满 60 秒暂停计时", (int)app.Timer.Phase, (int)TimerPhase.Paused);
+            Eq("进入已偏离后秒数从 0 起", app.Data.CurrentTask.ContinuousAwaySec, 0);
+            app.Task.TickAway(); app.Task.TickAway();
+            Eq("已偏离秒数按秒爬", app.Data.CurrentTask.ContinuousAwaySec, 2);
+            Eq("爬秒数不会重复计数", app.Task.AwayCount, 1);
+
+            // ④ 第 3 次之后点「确认」：第 4 次「已偏离」直接按中断结束任务
+            app.Task.AwayCount = 3;
+            app.Task.AwayWarning = true;
+            app.Task.ConfirmAwayWarning();
+            True("确认后弹窗收起", !app.Task.AwayWarning);
+            True("确认后进入第 4 次检测", app.Task.AwayArmed);
+            Eq("确认后继续计时", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            for (int i = 0; i < TaskRunner.AwayGraceSeconds; i++) app.Task.TickAway();
+            True("第 4 次已偏离直接结束任务", app.Data.CurrentTask == null);
+            True("结束后弹「再接再厉」提示", app.Task.SettledNotice);
+            app.Task.DismissSettledNotice();
+            True("「知道了」后提示收起", !app.Task.SettledNotice);
+
+            // ⑤ 点「我在处理其他事务」：暂停 + 计数清零
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            app2.Data.CurrentTask = new TaskState();
+            app2.Data.CurrentTask.ProcessName = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
+            app2.Data.CurrentTask.TotalFocusSeconds = 30 * 60;
+            app2.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app2.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app2.Data.CurrentTask.RoundsTotal = 2;
+            app2.Data.CurrentTask.RoundIndex = 1;
+            app2.Data.CurrentTask.Status = TaskState.StatusAway;
+            app2.Task.AwayCount = 3;
+            app2.Task.AwayWarning = true;
+            app2.Timer.StartFocus(15, "task");
+
+            app2.Task.DeferAwayWarning();
+            True("「在处理其他事务」后弹窗收起", !app2.Task.AwayWarning);
+            Eq("「在处理其他事务」后计数归零", app2.Task.AwayCount, 0);
+            True("「在处理其他事务」后取消第 4 次检测", !app2.Task.AwayArmed);
+            Eq("「在处理其他事务」后计时暂停", (int)app2.Timer.Phase, (int)TimerPhase.Paused);
+
+            // ⑥ 弹窗确实画出来了，两枚按钮都在且不重叠
+            app2.Task.AwayWarning = true;
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app2) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+                Settle(ui, g, 4);
+                var hots = new List<Hotspot>(ui.Hotspots);
+                var ok = FindHot(hots, "awayWarnOk");
+                var defer = FindHot(hots, "awayWarnDefer");
+                True("有「确认」按钮", ok != null && ok.Click != null);
+                True("有「我在处理其他事务」按钮", defer != null && defer.Click != null);
+                if (ok != null && defer != null) True("两个按钮不重叠", !ok.Rect.IntersectsWith(defer.Rect));
+                True("弹窗有整窗屏障", FindHot(hots, "awayWarnBackdrop") != null);
+            }
+            app2.Task.AwayWarning = false;
+
+            // ⑦ 结束提示：带「知道了」按钮，点了就收起
+            app2.Task.SettledNotice = true;
+            using (var bmp2 = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g2 = Graphics.FromImage(bmp2))
+            {
+                var ui2 = new UiRoot(app2) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+                Settle(ui2, g2, 3);
+                var hots2 = new List<Hotspot>(ui2.Hotspots);
+                var ok2 = FindHot(hots2, "settledNoticeOk");
+                True("结束提示有「知道了」按钮", ok2 != null && ok2.Click != null);
+                True("结束提示有整窗屏障", FindHot(hots2, "settledNoticeBackdrop") != null);
+            }
+            app2.Task.DismissSettledNotice();
+            True("「知道了」后结束提示不再出现", !app2.Task.SettledNotice);
+        }
+
+        /// <summary>跳过休息要推进轮次（否则任务停在"没有计时"的死局）+ 调试一键完成要能结束休息。</summary>
+        private static void TestBreakSkipAndHeal()
+        {
+            Group("跳过休息与空转自愈");
+
+            // ① 调试「立即完成当前计时」在休息阶段也要生效
+            var t = new TimerEngine();
+            int breakDone = 0;
+            t.BreakCompleted += delegate { breakDone++; };
+            t.StartBreak(300);
+            t.DebugCompleteNow();
+            Eq("休息时一键完成会触发休息结束", breakDone, 1);
+            Eq("休息完成后回到空闲", (int)t.Phase, (int)TimerPhase.Idle);
+
+            // ② 休息进行中点「跳过」：必须直接进下一轮，不能只把休息清掉
+            var app = new AppState();
+            app.Data = new AppData();
+            app.Data.CurrentTask = new TaskState();
+            app.Data.CurrentTask.ProcessName = System.Diagnostics.Process.GetCurrentProcess().ProcessName;
+            app.Data.CurrentTask.TotalFocusSeconds = 45 * 60;
+            app.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app.Data.CurrentTask.RoundsTotal = 3;
+            app.Data.CurrentTask.RoundIndex = 1;
+            app.Data.CurrentTask.Status = TaskState.StatusRunning;
+
+            app.Timer.StartBreak(300);
+            app.Task.SkipBreak();
+            Eq("休息中跳过 → 直接进下一轮", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            Eq("轮次推进到第 2 轮", app.Data.CurrentTask.RoundIndex, 2);
+
+            // ③ 休息卡上点「跳过休息」（此时计时器空闲）同样要进下一轮
+            app.Timer.Reset();
+            app.Data.CurrentTask.RoundIndex = 1;
+            app.Data.CurrentTask.Status = TaskState.StatusRunning;
+            app.Task.SkipBreak();
+            Eq("休息卡跳过 → 进下一轮", (int)app.Timer.Phase, (int)TimerPhase.Focusing);
+            Eq("轮次推进到第 2 轮（卡片入口）", app.Data.CurrentTask.RoundIndex, 2);
+
+            // ④ 万一还是空转了：Update 里要能自愈，重开当前轮
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            app2.Data.CurrentTask = new TaskState();
+            app2.Data.CurrentTask.ProcessName = "no_such_process_zzz";
+            app2.Data.CurrentTask.TotalFocusSeconds = 45 * 60;
+            app2.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app2.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app2.Data.CurrentTask.RoundsTotal = 3;
+            app2.Data.CurrentTask.RoundIndex = 1;
+            app2.Data.CurrentTask.Status = TaskState.StatusRunning;
+            app2.Timer.Reset();
+            Eq("前置：计时器空闲", (int)app2.Timer.Phase, (int)TimerPhase.Idle);
+            app2.Task.Update();
+            Eq("空转自愈后开始计时", (int)app2.Timer.Phase, (int)TimerPhase.Focusing);
+        }
+
+        /// <summary>调试「立即检测是否偏离任务」+ 偏离态下禁用「继续」+ 偏离秒数实时走。</summary>
+        private static void TestAwayProbeAndResumeLock()
+        {
+            Group("偏离检测与继续禁用");
+
+            // ① 没有任务时什么都没发生
+            var empty = new AppState();
+            empty.Data = new AppData();
+            Eq("没有任务 → NoTask", (int)empty.Task.DebugForceAway(), (int)TaskRunner.AwayProbeResult.NoTask);
+
+            // ② 任务在跑、目标程序不在前台 → 立刻进入「已偏离」并计数 +1
+            var app = new AppState();
+            app.Data = new AppData();
+            app.Data.CurrentTask = new TaskState();
+            app.Data.CurrentTask.ProcessName = "zzz_never_a_foreground_app";
+            app.Data.CurrentTask.TotalFocusSeconds = 45 * 60;
+            app.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app.Data.CurrentTask.RoundsTotal = 3;
+            app.Data.CurrentTask.RoundIndex = 1;
+            app.Data.CurrentTask.Status = TaskState.StatusRunning;
+            app.Timer.StartFocus(15, "task");
+
+            Eq("不在前台 → Entered", (int)app.Task.DebugForceAway(), (int)TaskRunner.AwayProbeResult.Entered);
+            Eq("计数 +1", app.Task.AwayCount, 1);
+            Eq("调试强制偏离后秒数从 0 起", app.Data.CurrentTask.ContinuousAwaySec, 0);
+            Eq("状态转已偏离", app.Data.CurrentTask.Status, TaskState.StatusAway);
+            Eq("计时暂停", (int)app.Timer.Phase, (int)TimerPhase.Paused);
+
+            // ③ 已经偏离时再点：不重复计数
+            Eq("重复点 → AlreadyAway", (int)app.Task.DebugForceAway(), (int)TaskRunner.AwayProbeResult.AlreadyAway);
+            Eq("计数保持 1", app.Task.AwayCount, 1);
+
+            // ④ 已偏离时秒数要继续走（卡片是实时读数），但计数不再变
+            int before = app.Data.CurrentTask.ContinuousAwaySec;
+            app.Task.TickAway();
+            app.Task.TickAway();
+            True("偏离秒数继续走", app.Data.CurrentTask.ContinuousAwaySec >= before + 2);
+            Eq("秒数继续走但计数不变", app.Task.AwayCount, 1);
+
+            // ⑤ 已点过「确认」后再强制偏离一次 = 第 4 次 → 直接结束任务
+            app.Data.CurrentTask.Status = TaskState.StatusRunning;
+            app.Task.AwayArmed = true;
+            app.Timer.StartFocus(15, "task");
+            Eq("第 4 次强制偏离 → Finished", (int)app.Task.DebugForceAway(), (int)TaskRunner.AwayProbeResult.Finished);
+            True("任务已结束", app.Data.CurrentTask == null);
+            Eq("提示里的偏离次数=本次那一下", app.Task.SettledAwayCount, 2);
+            True("结束提示已置位", app.Task.SettledNotice);
+
+            // ⑥ 偏离态下主按钮「继续」点不动
+            var app2 = new AppState();
+            app2.Data = new AppData();
+            app2.Data.CurrentTask = new TaskState();
+            app2.Data.CurrentTask.ProcessName = "zzz_never_a_foreground_app";
+            app2.Data.CurrentTask.TotalFocusSeconds = 45 * 60;
+            app2.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app2.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app2.Data.CurrentTask.RoundsTotal = 3;
+            app2.Data.CurrentTask.RoundIndex = 1;
+            app2.Data.CurrentTask.Status = TaskState.StatusAway;
+            app2.Timer.StartFocus(15, "task");
+            app2.Timer.Pause();
+
+            using (var bmp = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g = Graphics.FromImage(bmp))
+            {
+                var ui = new UiRoot(app2) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+                Settle(ui, g, 4);
+                var primary = FindHot(new List<Hotspot>(ui.Hotspots), "btnPrimary");
+                True("主按钮仍在（画成禁用态）", primary != null);
+                if (primary != null)
+                {
+                    var c = Center(primary.Rect);
+                    ui.OnMouseDown(c);
+                    ui.OnMouseUp(c);
+                }
+                Eq("偏离态下点「继续」不会真的续上", (int)app2.Timer.Phase, (int)TimerPhase.Paused);
+            }
+
+            // ⑦ 第 3 次「已偏离」当场弹窗（不依赖"回到目标程序"那条路径）
+            var app3 = new AppState();
+            app3.Data = new AppData();
+            app3.Data.CurrentTask = new TaskState();
+            app3.Data.CurrentTask.ProcessName = "zzz_never_a_foreground_app";
+            app3.Data.CurrentTask.TotalFocusSeconds = 45 * 60;
+            app3.Data.CurrentTask.FocusRoundSeconds = 15 * 60;
+            app3.Data.CurrentTask.BreakRoundSeconds = 5 * 60;
+            app3.Data.CurrentTask.RoundsTotal = 3;
+            app3.Data.CurrentTask.RoundIndex = 1;
+            string lastToast = null;
+            app3.ToastRequested += delegate(object s, string m) { lastToast = m; };
+            for (int cycle = 1; cycle <= 3; cycle++)
+            {
+                app3.Data.CurrentTask.Status = TaskState.StatusRunning;
+                app3.Timer.StartFocus(15, "task");
+                for (int i = 0; i < TaskRunner.AwayGraceSeconds; i++) app3.Task.TickAway();
+                Eq("第 " + cycle + " 次偏离计数", app3.Task.AwayCount, cycle);
+            }
+            True("第 3 次当场弹出强提醒", app3.Task.AwayWarning);
+
+            // 点「确认」后第 4 次进入偏离 → 结束任务，提示里的次数应为 4
+            app3.Task.ConfirmAwayWarning();
+            for (int i = 0; i < TaskRunner.AwayGraceSeconds; i++) app3.Task.TickAway();
+            True("第 4 次后任务结束", app3.Data.CurrentTask == null);
+            Eq("提示文案里的次数=4", app3.Task.SettledAwayCount, 4);
+            True("顶部提示说明了次数与自动中断", lastToast != null && lastToast.Contains("您偏离目标 4 次了") && lastToast.Contains("自动中断"), "toast=" + lastToast);
+
+            // ⑧ 模态卡显示期间不做"只刷环"（否则环会叠在弹窗上）
+            var app4 = new AppState();
+            app4.Data = new AppData();
+            app4.Timer.StartFocus(25, "25");
+            var ui4 = new UiRoot(app4) { Scale = 1f, Bounds = new RectangleF(0, 0, 1040, 700) };
+            using (var bmp4 = new Bitmap(1040, 700, PixelFormat.Format32bppArgb))
+            using (var g4 = Graphics.FromImage(bmp4))
+            {
+                Settle(ui4, g4, 2);
+                True("平时可以只刷环", ui4.CanDrawRingOnly);
+                app4.Task.SettledNotice = true;
+                Settle(ui4, g4, 2);
+                True("「再接再厉」显示时禁止只刷环", !ui4.CanDrawRingOnly);
+                app4.Task.DismissSettledNotice();
+            }
         }
 
         /// <summary>第一批 BUG 回归：时钟长形态、确认条遮挡热区。</summary>
